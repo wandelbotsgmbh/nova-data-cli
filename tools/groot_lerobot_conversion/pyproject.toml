@@ -1,0 +1,29 @@
+[project]
+name = "groot-lerobot-conversion"
+version = "0.1.0"
+description = "Isolated CLI that converts a LeRobot v3.0 export into GR00T-compatible LeRobot v2.1"
+# GR00T's conversion tooling pins an older LeRobot and Python < 3.12. This is
+# intentionally NOT part of the nova-export service env (Python >= 3.12,
+# lerobot 0.5.x) — the two cannot coexist in one environment, which is why this
+# lives as its own pinned subproject. See README.md.
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "huggingface_hub",
+    "jsonlines",
+    "numpy",
+    "pyarrow",
+    "tqdm",
+    # Pinned to the exact commit NVIDIA/Isaac-GR00T uses for this converter, so
+    # the internal lerobot.datasets.utils symbols it imports remain available.
+    "lerobot @ git+https://github.com/huggingface/lerobot.git@c75455a6de5c818fa1bb69fb2d92423e86c70475",
+]
+
+[project.scripts]
+groot-convert = "groot_convert:main"
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["convert_v3_to_v2", "groot_convert"]

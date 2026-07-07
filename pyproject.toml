@@ -1,0 +1,50 @@
+[project]
+name = "nova-export"
+version = "0.1.0"
+description = "NOVA data export CLI (local)"
+requires-python = ">=3.12"
+dependencies = [
+    "av>=12.0",
+    "loguru>=0.7",
+    "numpy>=1.26",
+    "pyarrow>=15.0",
+    "pydantic>=2.0",
+    "rerun-sdk[catalog]>=0.33",
+    "tqdm>=4.66",
+    "datafusion>=52,<53",
+    "lerobot>=0.5",
+]
+
+[project.scripts]
+nova-data-cli = "nova_export.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nova_export"]
+
+# lerobot doesn't yet support newer rerun-sdk versions transitively,
+# so we pin rerun-sdk and use CPU-only PyTorch to reduce image size.
+[tool.uv]
+override-dependencies = [
+    "rerun-sdk[catalog]>=0.33",
+]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
