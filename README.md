@@ -39,6 +39,10 @@ A JSON file selecting the format, FPS, and which sources map to action / state /
 cameras. Examples: [`examples/`](examples/). Schema:
 [`ExportConfig`](src/nova_export/export/config.py).
 
+**📖 See the [Export guide](docs/export-guide.md)** for a walkthrough of every
+config field, the export formats, camera resizing, and how the trimming modes
+choose episode boundaries (with figures).
+
 ## Tests
 
 ```bash
