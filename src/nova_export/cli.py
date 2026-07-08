@@ -12,7 +12,9 @@ Usage:
 
 Recordings are expected under <recordings-dir>/<dataset>/<recording_id>/recording.rrd
 (the layout the collector writes after a recording is stopped). --dataset may also
-be a direct path to the dataset directory, in which case --recordings-dir is ignored.
+be a direct path, to either that dataset directory (exports every recording.rrd
+found under it) or a single recording directory (exports just that one) — see
+docs/export-guide.md#selecting-recordings-to-export for details.
 
 Formats (set via the config's "format" field):
 - "lerobot_v3": writes a LeRobot v3.0 dataset.
@@ -177,15 +179,23 @@ def main() -> None:
     def on_progress(current: int, total: int) -> None:
         logger.info("Episode {}/{}", current, total)
 
-    with suppress_native_stderr(enabled=not args.verbose):
-        result = export_recordings(
-            output_dir=args.output,
-            config=config,
-            dataset_name=dataset_name,
-            catalog_url=args.catalog_url,
-            rrd_paths=rrd_paths,
-            progress_callback=on_progress,
-        )
+    try:
+        with suppress_native_stderr(enabled=not args.verbose):
+            result = export_recordings(
+                output_dir=args.output,
+                config=config,
+                dataset_name=dataset_name,
+                catalog_url=args.catalog_url,
+                rrd_paths=rrd_paths,
+                progress_callback=on_progress,
+            )
+    except (ValueError, RuntimeError) as e:
+        # Config/data problems (e.g. a source name not in the recording) — show the
+        # actionable message, not a stack trace. Use -v for the full traceback.
+        if args.verbose:
+            raise
+        logger.error("Export failed:\n{}", e)
+        raise SystemExit(1) from e
 
     logger.success(
         "Exported {} episodes ({} frames) → {}",

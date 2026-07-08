@@ -12,6 +12,7 @@ Tests cover:
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -19,7 +20,9 @@ from unittest.mock import MagicMock, patch
 import av
 import numpy as np
 import numpy.typing as npt
+import pyarrow as pa
 import pytest
+from pydantic import ValidationError
 
 from nova_export.export.config import CameraSource, ExportConfig
 from nova_export.export.episode_sampler import (
@@ -28,6 +31,7 @@ from nova_export.export.episode_sampler import (
     Sample,
     make_time_grid,
 )
+from nova_export.export.exporter import export_recordings
 from nova_export.export.heads.base import ExportResult
 from nova_export.export.heads.lerobot import LeRobotHead
 from nova_export.export.video_decoder import (
@@ -616,6 +620,243 @@ class TestEpisodeSamplerHelpers:
                 assert np.array_equal(sample.images["wrist"], frames[i])
                 assert sample.action[0] == float(i)
                 assert sample.state[0] == float(i) * 2
+
+
+# =============================================================================
+# Source validation (helpful error when a config source is missing)
+# =============================================================================
+
+
+class TestSourceValidation:
+    """The preflight validator reports missing sources with what's available."""
+
+    COLUMNS = [
+        "/actions_target:Scalars:scalars",
+        "/joint_positions:Scalars:scalars",
+        "/gripper:Scalars:scalars",
+        "/cam_flange:VideoStream:sample",
+        "/cam_top:VideoStream:sample",
+        "canonical_time",
+    ]
+    TIMELINES = ["canonical_time", "camera_time"]
+
+    def test_extracts_source_names_by_suffix(self):
+        from nova_export.export.exporter import _sources_for_suffix
+
+        assert _sources_for_suffix(self.COLUMNS, ":Scalars:scalars") == [
+            "actions_target",
+            "gripper",
+            "joint_positions",
+        ]
+        assert _sources_for_suffix(self.COLUMNS, ":VideoStream:sample") == [
+            "cam_flange",
+            "cam_top",
+        ]
+
+    def _signals(self):
+        from nova_export.export.exporter import _sources_for_suffix
+
+        return _sources_for_suffix(self.COLUMNS, ":Scalars:scalars")
+
+    def _cameras(self):
+        from nova_export.export.exporter import _sources_for_suffix
+
+        return _sources_for_suffix(self.COLUMNS, ":VideoStream:sample")
+
+    def test_valid_config_has_no_problems(self):
+        from nova_export.export.exporter import _find_missing_sources
+
+        config = ExportConfig(
+            index_column="canonical_time",
+            action=["actions_target"],
+            state=["joint_positions", "gripper"],
+            cameras=[CameraSource(source="cam_flange")],
+        )
+        assert (
+            _find_missing_sources(
+                config,
+                timelines=self.TIMELINES,
+                signals=self._signals(),
+                cameras=self._cameras(),
+            )
+            == []
+        )
+
+    def test_missing_camera_lists_available(self):
+        from nova_export.export.exporter import _find_missing_sources
+
+        config = ExportConfig(
+            index_column="canonical_time",
+            action=["actions_target"],
+            cameras=[CameraSource(source="cam_cobot_flange")],
+        )
+        problems = "\n".join(
+            _find_missing_sources(
+                config,
+                timelines=self.TIMELINES,
+                signals=self._signals(),
+                cameras=self._cameras(),
+            )
+        )
+        assert "cam_cobot_flange" in problems  # the bad name
+        assert "cam_flange" in problems and "cam_top" in problems  # available ones
+
+    def test_missing_signal_and_timeline_reported(self):
+        from nova_export.export.exporter import _find_missing_sources
+
+        config = ExportConfig(
+            index_column="wallclock",  # not a real timeline
+            action=["teleop"],  # not a real signal
+            cameras=[CameraSource(source="cam_flange")],
+        )
+        problems = _find_missing_sources(
+            config,
+            timelines=self.TIMELINES,
+            signals=self._signals(),
+            cameras=self._cameras(),
+        )
+        joined = "\n".join(problems)
+        assert "wallclock" in joined and "canonical_time" in joined  # timeline miss
+        assert "teleop" in joined and "actions_target" in joined  # signal miss
+
+
+# =============================================================================
+# Max episode duration (raw-span safety check, independent of trimming)
+# =============================================================================
+
+
+class TestMaxEpisodeDuration:
+    """`max_episode_duration_s` rejects segments by raw recording span.
+
+    This is a plain upper-bound sanity check read from cheap dataset-manifest
+    metadata (`dataset.get_index_ranges()`) — no query, no video decode, and
+    unrelated to trimming. It exists to catch stuck/left-running recordings
+    before they cost minutes of wasted video decoding.
+    """
+
+    def test_unset_by_default(self):
+        assert ExportConfig().max_episode_duration_s is None
+
+    def test_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            ExportConfig(max_episode_duration_s=0)
+        with pytest.raises(ValidationError):
+            ExportConfig(max_episode_duration_s=-5)
+
+    @staticmethod
+    def _mock_index_ranges(start, end):
+        """Build a mock DataFusion DataFrame matching get_index_ranges()'s chain."""
+        table = pa.table({"canonical_time:start": [start], "canonical_time:end": [end]})
+        mock = MagicMock()
+        mock.filter.return_value.select.return_value.to_arrow_table.return_value = table
+        return mock
+
+    def test_reads_duration_from_index_ranges(self):
+        from nova_export.export.exporter import _raw_segment_duration_s
+
+        start = datetime(2026, 1, 1, 10, 0, 0)
+        end = start + timedelta(seconds=42.5)
+        index_ranges = self._mock_index_ranges(start, end)
+
+        duration = _raw_segment_duration_s(index_ranges, "seg-1", "canonical_time")
+        assert duration == pytest.approx(42.5)
+
+    def test_segment_not_found_returns_none(self):
+        from nova_export.export.exporter import _raw_segment_duration_s
+
+        mock = MagicMock()
+        mock.filter.return_value.select.return_value.to_arrow_table.return_value = (
+            pa.table({"canonical_time:start": [], "canonical_time:end": []})
+        )
+        assert _raw_segment_duration_s(mock, "missing-seg", "canonical_time") is None
+
+    def test_query_failure_returns_none(self):
+        from nova_export.export.exporter import _raw_segment_duration_s
+
+        mock = MagicMock()
+        mock.filter.side_effect = RuntimeError("boom")
+        assert _raw_segment_duration_s(mock, "seg-1", "canonical_time") is None
+
+    def test_within_limit_is_kept(self):
+        """End-to-end: a segment under the limit is processed, not skipped."""
+        config = ExportConfig(
+            fps=15,
+            action=["actions_target"],
+            cameras=[CameraSource(source="wrist")],
+            max_episode_duration_s=60.0,
+        )
+        start = datetime(2026, 1, 1, 10, 0, 0)
+        end = start + timedelta(seconds=10.0)  # well under the limit
+        mock_dataset = MagicMock()
+        mock_dataset.get_index_ranges.return_value = self._mock_index_ranges(
+            start, end
+        )
+        mock_dataset.segment_ids.return_value = ["seg-1"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "output"
+            with (
+                patch("nova_export.export.exporter.CatalogClient") as mock_client_cls,
+                patch("nova_export.export.exporter._validate_sources"),
+                patch(
+                    "nova_export.export.episode_sampler.EpisodeSampler._process_segment",
+                    return_value=create_test_episode(num_samples=5, fps=15),
+                ) as mock_process,
+                patch(
+                    "lerobot.datasets.lerobot_dataset.LeRobotDataset"
+                ) as mock_lerobot_cls,
+            ):
+                mock_client_cls.return_value.get_dataset.return_value = mock_dataset
+                mock_lerobot_cls.create.return_value = MagicMock(
+                    num_episodes=1, num_frames=5
+                )
+
+                result = export_recordings(
+                    output_dir=output_dir,
+                    config=config,
+                    dataset_name="d",
+                    catalog_url="http://fake",
+                )
+
+            mock_process.assert_called_once()
+            assert result.num_episodes == 1
+
+    def test_exceeding_limit_is_skipped_before_processing(self):
+        """End-to-end: a segment over the limit never reaches _process_segment."""
+        config = ExportConfig(
+            fps=15,
+            action=["actions_target"],
+            cameras=[CameraSource(source="wrist")],
+            max_episode_duration_s=60.0,
+        )
+        start = datetime(2026, 1, 1, 10, 0, 0)
+        end = start + timedelta(seconds=4488.6)  # way over the limit
+        mock_dataset = MagicMock()
+        mock_dataset.get_index_ranges.return_value = self._mock_index_ranges(
+            start, end
+        )
+        mock_dataset.segment_ids.return_value = ["seg-1"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "output"
+            with (
+                patch(
+                    "nova_export.export.exporter.CatalogClient"
+                ) as mock_client_cls,
+                patch("nova_export.export.exporter._validate_sources"),
+                patch(
+                    "nova_export.export.episode_sampler.EpisodeSampler._process_segment"
+                ) as mock_process,
+            ):
+                mock_client_cls.return_value.get_dataset.return_value = mock_dataset
+                with pytest.raises(RuntimeError, match="exceeds max_episode_duration_s"):
+                    export_recordings(
+                        output_dir=output_dir,
+                        config=config,
+                        dataset_name="d",
+                        catalog_url="http://fake",
+                    )
+                mock_process.assert_not_called()
 
 
 # =============================================================================

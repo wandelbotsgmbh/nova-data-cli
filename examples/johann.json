@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "format": "groot",
+  "fps": 15,
+  "index_column": "canonical_time",
+  "action": ["actions_target"],
+  "state": ["joint_positions_comanded", "gripper_cobot"],
+  "max_episode_duration_s": 60,
+  "cameras": [
+    {
+      "source": "cam_cobot_flange"
+    },
+    {
+      "source": "cam_scene_1"
+    }
+  ],
+  "trimming": {
+    "mode": "signal_change",
+    "source": "joint_positions_comanded",
+    "threshold": 0.01,
+    "tail_ms": 500
+  },
+  "task_description": "pick-and-place",
+  "dataset_id": "nova/pick-and-place"
+}

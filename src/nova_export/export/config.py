@@ -142,6 +142,17 @@ class ExportConfig(BaseModel):
         description="Episode trimming configuration (controls start/end bounds)",
     )
 
+    max_episode_duration_s: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Reject a segment outright if its raw recording span exceeds this "
+            "many seconds — an upper-bound safety check for stuck or "
+            "left-running recordings, independent of trimming. Checked cheaply "
+            "via dataset metadata before any video decode. Unset means no limit."
+        ),
+    )
+
     task_description: str = Field(
         default="task",
         description="Task label written to the dataset",

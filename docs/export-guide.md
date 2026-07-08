@@ -25,20 +25,50 @@ uv run nova-data-cli \
     --output ./exports/pick-and-place
 ```
 
+## Selecting recordings to export
+
+The collector writes recordings as `<dataset>/<recording_id>/recording.rrd`. `--dataset`
+auto-detects which level of that layout you're pointing at, so both of these work:
+
+```bash
+# Export every recording under a dataset — each recording.rrd becomes one episode.
+uv run nova-data-cli --dataset ./recordings/pick-and-place-demo ...
+
+# Export a single recording directly (its own directory containing recording.rrd).
+uv run nova-data-cli --dataset ./recordings/pick-and-place-demo/008bfca20454 ...
+```
+
+The rule: if the path you pass contains a `recording.rrd` directly, it's treated as
+one recording; otherwise the CLI globs `*/recording.rrd` underneath it and loads
+every recording it finds as part of the same export.
+
+`--dataset` also accepts a plain **name** instead of a path, resolved under
+`--recordings-dir` (default `$STORAGE_DIR` or `./recordings`) — useful when your
+recordings live in a fixed root:
+
+```bash
+uv run nova-data-cli --recordings-dir ./recordings --dataset pick-and-place-demo ...
+# equivalent to: --dataset ./recordings/pick-and-place-demo
+```
+
+If the value already resolves to a directory (relative or absolute), it's used
+directly and `--recordings-dir` is ignored.
+
 ## Config reference
 
-| Field              | Type                        | Default          | What it does                                                                                                                                                                                |
-| ------------------ | --------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `format`           | `"lerobot_v3"` \| `"groot"` | `lerobot_v3`     | Target dataset format. See [Formats](#formats).                                                                                                                                             |
-| `fps`              | int (1–250)                 | `15`             | Fixed frame rate the data is **resampled** to. Every stream is aligned onto a grid at this rate. Higher = more frames, larger dataset; it does not create information that wasn't recorded. |
-| `index_column`     | string                      | `canonical_time` | The Rerun timeline used to build the time grid. `canonical_time` is the synchronized clock the collector writes; only change it if you know another timeline is better aligned.             |
-| `action`           | list[str]                   | `[]`             | Recording source(s) forming the **action** vector, concatenated in order. See [Sources](#sources-action-state-cameras).                                                                     |
-| `state`            | list[str]                   | `[]`             | Source(s) forming `observation.state`, concatenated in order. May be empty.                                                                                                                 |
-| `cameras`          | list[object]                | `[]`             | Camera streams → `observation.images.<source>`. Each may set `width`/`height` to resize. See [Cameras](#cameras--resizing).                                                                 |
-| `trimming`         | object                      | `all_present`    | How episode start/end bounds are chosen. See [Trimming](#trimming-the-important-part).                                                                                                      |
-| `task_description` | string                      | `"task"`         | Natural-language task label written to every frame.                                                                                                                                         |
-| `dataset_id`       | string                      | `nova/dataset`   | Dataset identifier — the LeRobot `repo_id` (also used for viz and Hugging Face push).                                                                                                       |
-| `version`          | int                         | `1`              | Config schema version. Leave at `1`.                                                                                                                                                        |
+| Field                    | Type                        | Default           | What it does                                                                                                                                                                                   |
+| ------------------------ | --------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `format`                 | `"lerobot_v3"` \| `"groot"` | `lerobot_v3`      | Target dataset format. See [Formats](#formats).                                                                                                                                                |
+| `fps`                    | int (1–250)                 | `15`              | Fixed frame rate the data is **resampled** to. Every stream is aligned onto a grid at this rate. Higher = more frames, larger dataset; it does not create information that wasn't recorded.    |
+| `index_column`           | string                      | `canonical_time`  | The Rerun timeline used to build the time grid. `canonical_time` is the synchronized clock the collector writes; only change it if you know another timeline is better aligned.                |
+| `action`                 | list[str]                   | `[]`              | Recording source(s) forming the **action** vector, concatenated in order. See [Sources](#sources-action-state-cameras).                                                                        |
+| `state`                  | list[str]                   | `[]`              | Source(s) forming `observation.state`, concatenated in order. May be empty.                                                                                                                    |
+| `cameras`                | list[object]                | `[]`              | Camera streams → `observation.images.<source>`. Each may set `width`/`height` to resize. See [Cameras](#cameras--resizing).                                                                    |
+| `trimming`               | object                      | `all_present`     | How episode start/end bounds are chosen. See [Trimming](#trimming-the-important-part).                                                                                                         |
+| `max_episode_duration_s` | float \| null               | `null` (no limit) | Reject a segment if its _raw_ recording span exceeds this many seconds — unrelated to trimming. See [Rejecting stuck or left-running recordings](#rejecting-stuck-or-left-running-recordings). |
+| `task_description`       | string                      | `"task"`          | Natural-language task label written to every frame.                                                                                                                                            |
+| `dataset_id`             | string                      | `nova/dataset`    | Dataset identifier — the LeRobot `repo_id` (also used for viz and Hugging Face push).                                                                                                          |
+| `version`                | int                         | `1`               | Config schema version. Leave at `1`.                                                                                                                                                           |
 
 ## Formats
 
@@ -172,6 +202,24 @@ Same recording, all three modes overlaid with the activity trace. `all_present`
 and `signal_presence` keep the full stream span here; `signal_change` tightens
 onto the actual motion.
 
+## Rejecting stuck or left-running recordings
+
+Real recordings sometimes have a stuck sensor, a forgotten running recording, or
+another glitch that produces one segment that's dramatically longer than the
+rest — minutes or hours instead of seconds. `max_episode_duration_s` is a plain
+upper-bound safety check against that:
+
+```json
+"max_episode_duration_s": 60
+```
+
+This is **unrelated to trimming** - it checks the _raw_ recording span before
+any other processing. A segment whose raw span exceeds the limit is rejected
+outright. Leave it unset (the default) for no limit. Pick a value
+comfortably above your longest _legitimate_ recording so real episodes aren't
+rejected. Remember trimming still runs afterward on top of whatever passes this
+check, so this doesn't need to be tight.
+
 ## Choosing settings — quick heuristics
 
 - **Just want everything recorded?** `all_present` (default).
@@ -179,4 +227,22 @@ onto the actual motion.
 - **Need to cut idle lead-in/out automatically?** `signal_change` on a motion
   signal (e.g. `joint_positions`), `threshold` ≈ `0.01`, `tail_ms` ≈ `500`.
 - **Dataset too big / training input smaller?** Set camera `width`/`height`.
+- **A few episodes are way longer than the rest (stuck sensor, forgotten recording)?**
+  Set `max_episode_duration_s` to drop them.
 - **Targeting GR00T?** `"format": "groot"` — conversion runs automatically.
+
+## Inspect data using rerun
+
+To inspect the raw `.rrd` recordings, you can use [`rerun`] from this repo:
+
+```bash
+uv run rerun <path-to-recording.rrd>
+```
+
+## Exporting a lot of recordings at once?
+
+Upon export, all matched `.rrd` files are loaded into one temporary local server, which opens roughly one file handle per
+recording. The CLI tries to raise its own open-file limit automatically to fit,
+so this is usually invisible. If you still hit an OS "too many open files"
+error (rare — typically only when the _hard_ limit itself is capped very low),
+raise it manually before running: `ulimit -n 8192`.
