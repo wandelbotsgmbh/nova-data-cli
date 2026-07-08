@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "format": "lerobot_v3",
+  "fps": 15,
+  "index_column": "canonical_time",
+  "action": ["actions_target"],
+  "state": ["joint_positions", "gripper"],
+  "cameras": [
+    {
+      "source": "cam_flange",
+      "width": 224,
+      "height": 224
+    },
+    {
+      "source": "cam_top",
+      "width": 224,
+      "height": 224
+    },
+    {
+      "source": "cam_side",
+      "width": 224,
+      "height": 224
+    }
+  ],
+  "trimming": {
+    "mode": "signal_change",
+    "source": "joint_positions",
+    "threshold": 0.01,
+    "tail_ms": 500
+  },
+  "task_description": "pick-and-place",
+  "dataset_id": "nova/pick-and-place-resized"
+}
