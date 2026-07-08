@@ -8,15 +8,15 @@ LeRobot **v2.1** layout that NVIDIA Isaac GR00T expects, preserving the
 
 GR00T reads LeRobot **v2.1** (per-episode parquet + per-episode MP4 +
 `episodes.jsonl` / `tasks.jsonl`). The `nova-data-cli` export writes LeRobot
-**v3.0** via `lerobot>=0.5`, which has no v2.1 writer and no backward converter.
+**v3.0** via `lerobot>=0.6`, which has no v2.1 writer and no backward converter.
 
 The only maintained v3.0→v2.1 converter is NVIDIA's
 [`convert_v3_to_v2.py`](https://github.com/NVIDIA/Isaac-GR00T/tree/main/scripts/lerobot_conversion),
 which pins an **older LeRobot commit** and **Python < 3.12**. That conflicts
-with the export CLI's environment (Python ≥ 3.12, `lerobot` 0.5.x) on both
-axes — you cannot install both in one env. So this converter lives here as its
-own subproject with its own pinned dependencies, run as a standalone CLI. It
-shares no environment with the export CLI.
+with the export CLI's environment (Python ≥ 3.12) on both axes — you cannot
+install both in one env. So this converter lives here as its own subproject
+with its own pinned dependencies, run as a standalone CLI. It shares no
+environment with the export CLI.
 
 - `convert_v3_to_v2.py` — vendored **unmodified** from NVIDIA/Isaac-GR00T.
 - `groot_convert.py` — thin wrapper: local-directory invocation + forwards

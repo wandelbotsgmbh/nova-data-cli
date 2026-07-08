@@ -9,10 +9,10 @@ This head therefore reuses the LeRobot writer for the heavy lifting (Parquet +
 MP4 + LeRobot metadata) and only adds the `modality.json` descriptor during
 finalization.
 
-Version note: this writes a LeRobot **v3.0** dataset (what `lerobot>=0.5`
+Version note: this writes a LeRobot **v3.0** dataset (what `lerobot>=0.6`
 produces) plus `modality.json`. GR00T ingests LeRobot **v2.1**, so the export is
 a two-step flow — run this head, then convert with the standalone, separately
-pinned tool in `export/tools/groot_lerobot_conversion/` (it preserves the
+pinned tool in `tools/groot_lerobot_conversion/` (it preserves the
 `modality.json` written here). See that directory's README.
 
 Reference: https://github.com/NVIDIA/Isaac-GR00T (LeRobot-compatible datasets).

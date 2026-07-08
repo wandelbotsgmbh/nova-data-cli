@@ -12,7 +12,7 @@ dependencies = [
     "rerun-sdk[catalog]>=0.33",
     "tqdm>=4.66",
     "datafusion>=52,<53",
-    "lerobot>=0.5",
+    "lerobot[dataset-viz]>=0.6",
 ]
 
 [project.scripts]
@@ -33,12 +33,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/nova_export"]
 
-# lerobot doesn't yet support newer rerun-sdk versions transitively,
-# so we pin rerun-sdk and use CPU-only PyTorch to reduce image size.
+# Use CPU-only PyTorch to reduce image size (lerobot depends on torch/torchvision
+# unconditionally, even though this CLI only uses lerobot's dataset writer).
 [tool.uv]
-override-dependencies = [
-    "rerun-sdk[catalog]>=0.33",
-]
 index-strategy = "unsafe-best-match"
 
 [[tool.uv.index]]

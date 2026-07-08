@@ -102,6 +102,7 @@ class LeRobotHead(ExportHead):
         Args:
             features: Feature schema from infer_features().
         """
+        from lerobot.configs.video import RGBEncoderConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         self._features = features
@@ -120,7 +121,7 @@ class LeRobotHead(ExportHead):
             features=features,
             root=self.output_dir,
             use_videos=use_videos,
-            vcodec="h264",
+            rgb_encoder=RGBEncoderConfig(vcodec="h264"),
         )
 
     def write_episode(self, episode: Episode) -> bool:

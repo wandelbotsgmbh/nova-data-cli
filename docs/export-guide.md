@@ -231,9 +231,21 @@ check, so this doesn't need to be tight.
   Set `max_episode_duration_s` to drop them.
 - **Targeting GR00T?** `"format": "groot"` — conversion runs automatically.
 
-## Inspect data using rerun
+## Inspect exported dataset via LeRobot
 
-To inspect the raw `.rrd` recordings, you can use [`rerun`] from this repo:
+> [!IMPORTANT]
+> Only works for LeRobot v3.0 datasets (Parquet + MP4). But `groot` exports also produce a v3.0 dataset alongside the converted v2.1.
+
+```bash
+uv run lerobot-dataset-viz \
+  --repo-id local/dataset \
+  --root ./exports/<dataset> \
+  --episode-index 0
+```
+
+## Inspect raw data using rerun
+
+To inspect the raw `.rrd` recordings, you can use `rerun` from this repo:
 
 ```bash
 uv run rerun <path-to-recording.rrd>

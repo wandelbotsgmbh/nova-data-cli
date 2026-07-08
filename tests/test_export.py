@@ -497,14 +497,14 @@ class TestLeRobotHead:
 
             head.initialize(features)
 
-            mock_dataset_cls.create.assert_called_once_with(
-                repo_id="test/dataset",
-                fps=15,
-                features=features,
-                root=output_dir,
-                use_videos=True,
-                vcodec="h264",
-            )
+            mock_dataset_cls.create.assert_called_once()
+            call_kwargs = mock_dataset_cls.create.call_args.kwargs
+            assert call_kwargs["repo_id"] == "test/dataset"
+            assert call_kwargs["fps"] == 15
+            assert call_kwargs["features"] == features
+            assert call_kwargs["root"] == output_dir
+            assert call_kwargs["use_videos"] is True
+            assert call_kwargs["rgb_encoder"].vcodec == "h264"
 
     @patch("lerobot.datasets.lerobot_dataset.LeRobotDataset")
     def test_write_episode(self, mock_dataset_cls):
