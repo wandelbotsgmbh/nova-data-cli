@@ -102,6 +102,28 @@ class FrameCache:
         return idx
 
 
+def frame_diffs(
+    cache: FrameCache,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.float64]]:
+    """Mean-abs-pixel-diff between consecutive decoded frames.
+
+    Shared primitive for anything that needs "does this video show motion
+    right now" — `scripts/measure_camera_lag.py` and the per-episode
+    camera-onset detector used during export both call this (via
+    `camera_lag.find_camera_onset`) instead of re-implementing it.
+
+    Returns (timestamps_ns, diffs) where each diff is timestamped at the
+    midpoint between the two frames it compares, and diffs has one fewer
+    element than the cache has frames.
+    """
+    if cache.num_frames < 2:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+    frames = np.stack(cache.frames).astype(np.float32)
+    diffs = np.abs(np.diff(frames, axis=0)).mean(axis=(1, 2, 3))
+    mid_ts = cache.timestamps_ns[:-1] + np.diff(cache.timestamps_ns) // 2
+    return mid_ts, diffs
+
+
 def _is_annex_b(data: bytes) -> bool:
     """Check if data starts with Annex B start code."""
     return data[:3] == b"\x00\x00\x01" or data[:4] == b"\x00\x00\x00\x01"

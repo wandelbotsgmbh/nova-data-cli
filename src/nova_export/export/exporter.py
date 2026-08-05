@@ -490,6 +490,7 @@ def export_recordings(
             )
 
         result = head.finalize()
+        sampler.write_camera_lag_report(output_dir)
 
         # Log detailed summary
         logger.info("=" * 60)

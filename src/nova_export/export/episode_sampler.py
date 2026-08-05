@@ -12,7 +12,9 @@ can transform into any target format.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
 import av
@@ -21,6 +23,7 @@ import numpy.typing as npt
 from loguru import logger
 from tqdm import tqdm
 
+from nova_export.export.camera_lag import REFERENCE_CAMERA, measure_episode_delta_ns
 from nova_export.export.video_decoder import FrameCache, VideoDecoder
 
 if TYPE_CHECKING:
@@ -116,6 +119,10 @@ class EpisodeSampler:
         self.dataset = dataset
         self.segment_ids = segment_ids or dataset.segment_ids()
 
+        # segment_id -> measured camera-lag alignment result (or skip
+        # reason), written out by write_camera_lag_report() after export.
+        self.camera_lag_report: dict[str, dict[str, Any]] = {}
+
         self._video_decoders: dict[str, VideoDecoder] = {}
         self._target_sizes: dict[str, tuple[int, int] | None] = {}
         for cam in config.cameras:
@@ -185,6 +192,16 @@ class EpisodeSampler:
                 return None
             frame_caches[cam.source] = cache
 
+        # Step 1.5: Measure this episode's camera/state alignment delta,
+        # *before* trimming or grid-building. Trimming's own bounds are
+        # unaffected (still computed from joint_positions, not video), but
+        # every camera frame lookup for the rest of this episode must use
+        # the aligned timestamp, not just near the onset point. See
+        # docs/investigations/camera-joint-sync-lag.md.
+        camera_lag_delta_ns = self._measure_camera_lag(segment_id, frame_caches)
+        if camera_lag_delta_ns is None:
+            return None
+
         # Step 2: Find valid time range (intersection of all streams)
         valid_range = self._find_valid_range(segment_id, frame_caches)
         if valid_range is None:
@@ -208,7 +225,9 @@ class EpisodeSampler:
             return None
 
         # Step 5: Combine into samples
-        samples = self._build_samples(time_grid, frame_caches, action_state_data)
+        samples = self._build_samples(
+            time_grid, frame_caches, action_state_data, camera_lag_delta_ns
+        )
 
         return Episode(
             segment_id=segment_id,
@@ -384,6 +403,130 @@ class EpisodeSampler:
 
         return (raw_start_ns, raw_end_ns)
 
+    def _signal_change_onset(self, segment_id: str) -> int | None:
+        """Raw timestamp of the first sample-to-sample change exceeding
+        `trimming.threshold` on the trimming source column (L-inf norm for
+        vector signals) — the same "first real motion" detector
+        `_apply_trimming`'s `signal_change` mode uses internally, but
+        *without* the tail_ms backoff it applies to produce a trim boundary.
+
+        Deliberately duplicated (not routed through `_apply_trimming`) so
+        this can be used standalone as the state-side onset reference for
+        per-episode camera-lag alignment, computed before trimming runs, and
+        so trimming's own logic stays untouched. Only meaningful when
+        `trimming.mode == "signal_change"` — callers are expected to check
+        that first.
+        """
+        from datafusion import col
+
+        cfg = self.config.trimming
+        col_name = self.config.trimming_column()
+        view = self.dataset.filter_segments(segment_id)
+
+        reader = view.reader(index=self.config.index_column).filter(
+            col(col_name).is_not_null()
+        )
+        table = reader.select(self.config.index_column, col_name).to_arrow_table()
+
+        if table.num_rows < 2:
+            return None
+
+        times = self._extract_timestamps_ns(table[self.config.index_column])
+
+        raw_col = table[col_name]
+        if hasattr(raw_col.type, "value_type"):
+            values = np.array(raw_col.to_pylist(), dtype=np.float64)
+        else:
+            values = raw_col.to_numpy().astype(np.float64)
+
+        if values.ndim == 1:
+            diffs = np.abs(np.diff(values))
+        else:
+            diffs = np.max(np.abs(np.diff(values, axis=0)), axis=1)
+
+        active_indices = np.where(diffs > cfg.threshold)[0]
+        if len(active_indices) == 0:
+            return None
+
+        return int(times[active_indices[0]])
+
+    def _measure_camera_lag(
+        self,
+        segment_id: str,
+        frame_caches: dict[str, FrameCache],
+    ) -> int | None:
+        """Measure this episode's camera/state alignment delta (see
+        `camera_lag.py`), log it, and record it in `camera_lag_report`.
+
+        Returns the delta in ns to add to every camera frame lookup for this
+        episode (0 if alignment isn't applicable — trimming isn't in
+        `signal_change` mode, or the reference camera isn't configured), or
+        None if the episode must be skipped entirely (no clear onset found,
+        or the measured delta is implausible). Never returns a value meaning
+        "export unshifted" in a failure case — callers must skip on None.
+        """
+        if self.config.trimming.mode != "signal_change":
+            # No established "first real motion" signal to anchor on.
+            return 0
+
+        if REFERENCE_CAMERA not in frame_caches:
+            logger.warning(
+                "Segment {}: camera-lag alignment needs '{}' in config.cameras; "
+                "exporting this episode's camera frames unshifted",
+                segment_id[:8],
+                REFERENCE_CAMERA,
+            )
+            return 0
+
+        state_onset_ns = self._signal_change_onset(segment_id)
+        if state_onset_ns is None:
+            reason = "no state-side motion onset found for camera-lag alignment"
+            logger.warning("Segment {}: {} — skipping episode", segment_id[:8], reason)
+            self.camera_lag_report[segment_id] = {"status": "skipped", "reason": reason}
+            return None
+
+        delta_ns, error = measure_episode_delta_ns(
+            frame_caches[REFERENCE_CAMERA], state_onset_ns
+        )
+        if error is not None:
+            logger.warning(
+                "Segment {}: camera-lag alignment failed ({}) — skipping episode",
+                segment_id[:8],
+                error,
+            )
+            self.camera_lag_report[segment_id] = {
+                "status": "skipped",
+                "reason": error,
+                "state_onset_ns": state_onset_ns,
+            }
+            return None
+
+        logger.info(
+            "Segment {}: camera-lag delta = {:.1f}ms (state onset {}, camera onset {})",
+            segment_id[:8],
+            delta_ns / 1e6,
+            state_onset_ns,
+            state_onset_ns + delta_ns,
+        )
+        self.camera_lag_report[segment_id] = {
+            "status": "ok",
+            "delta_ns": delta_ns,
+            "delta_ms": round(delta_ns / 1e6, 1),
+            "state_onset_ns": state_onset_ns,
+        }
+        return delta_ns
+
+    def write_camera_lag_report(self, output_dir: Path) -> None:
+        """Write per-episode camera-lag measurements to
+        `<output_dir>/camera_lag_report.json` (segment_id -> measured delta,
+        or skip reason) so they're inspectable after the export finishes,
+        not just console/loguru noise."""
+        if not self.camera_lag_report:
+            return
+        report_path = output_dir / "camera_lag_report.json"
+        report_path.write_text(json.dumps(self.camera_lag_report, indent=2))
+        logger.info("Camera-lag report written to {}", report_path)
+
     def _query_action_state(
         self,
         segment_id: str,
@@ -506,6 +649,7 @@ class EpisodeSampler:
         time_grid: npt.NDArray[np.int64],
         frame_caches: dict[str, FrameCache],
         action_state_data: dict[int, dict[str, npt.NDArray[np.float32]]],
+        camera_lag_delta_ns: int = 0,
     ) -> list[Sample]:
         """Combine video frames and action/state into Sample objects.
 
@@ -513,6 +657,11 @@ class EpisodeSampler:
             time_grid: Target timestamps.
             frame_caches: Decoded frame caches.
             action_state_data: Action/state data at each timestamp.
+            camera_lag_delta_ns: This episode's measured camera-lag delta
+                (see `_measure_camera_lag`). Added to every camera frame
+                lookup timestamp so the frame pulled for grid-time `t` is
+                the one whose visual content actually matches `t`, not
+                `t - delta`. Zero if alignment wasn't measured/applicable.
 
         Returns:
             List of Sample objects.
@@ -537,7 +686,7 @@ class EpisodeSampler:
             all_images_ok = True
 
             for cam_name, cache in frame_caches.items():
-                frame = cache.get_frame_at(ts_int)
+                frame = cache.get_frame_at(ts_int + camera_lag_delta_ns)
                 if frame is None:
                     logger.debug(
                         "Missing frame for {} at timestamp {}", cam_name, ts_int
