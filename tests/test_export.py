@@ -1073,6 +1073,126 @@ class TestMaxEpisodeDuration:
 
 
 # =============================================================================
+# Deterministic segment / episode ordering
+# =============================================================================
+
+
+class TestDeterministicSegmentOrder:
+    """Segment discovery must yield the same episode order on every run.
+
+    `dataset.segment_ids()` order is not stable across runs of the local Rerun
+    server (identical .rrd inputs were observed to swap episode 0/1), so the
+    exporter orders discovered segments by recording start time (from
+    `get_index_ranges()` manifest metadata), falling back to segment-ID order.
+    """
+
+    @staticmethod
+    def _mock_dataset(segment_ids, starts_by_segment):
+        """Mock dataset whose get_index_ranges() serves the given start times."""
+        table = pa.table(
+            {
+                "rerun_segment_id": list(starts_by_segment.keys()),
+                "canonical_time:start": list(starts_by_segment.values()),
+            }
+        )
+        mock = MagicMock()
+        mock.segment_ids.return_value = list(segment_ids)
+        mock.get_index_ranges.return_value.select.return_value.to_arrow_table.return_value = table
+        return mock
+
+    def test_orders_by_recording_start_time(self):
+        from nova_export.export.exporter import _deterministic_segment_ids
+
+        t0 = datetime(2026, 1, 1, 10, 0, 0)
+        starts = {
+            "seg-late": t0 + timedelta(minutes=30),
+            "seg-early": t0,
+            "seg-mid": t0 + timedelta(minutes=10),
+        }
+        dataset = self._mock_dataset(["seg-late", "seg-early", "seg-mid"], starts)
+
+        result = _deterministic_segment_ids(dataset, "canonical_time")
+        assert result == ["seg-early", "seg-mid", "seg-late"]
+
+    def test_same_order_regardless_of_discovery_order(self):
+        from nova_export.export.exporter import _deterministic_segment_ids
+
+        t0 = datetime(2026, 1, 1, 10, 0, 0)
+        starts = {"a": t0 + timedelta(minutes=5), "b": t0}
+
+        run1 = _deterministic_segment_ids(
+            self._mock_dataset(["a", "b"], starts), "canonical_time"
+        )
+        run2 = _deterministic_segment_ids(
+            self._mock_dataset(["b", "a"], starts), "canonical_time"
+        )
+        assert run1 == run2 == ["b", "a"]
+
+    def test_segments_without_start_time_sort_last_by_id(self):
+        from nova_export.export.exporter import _deterministic_segment_ids
+
+        t0 = datetime(2026, 1, 1, 10, 0, 0)
+        # "seg-z" and "seg-a" have no start-time metadata at all.
+        dataset = self._mock_dataset(
+            ["seg-z", "seg-timed", "seg-a"], {"seg-timed": t0}
+        )
+
+        result = _deterministic_segment_ids(dataset, "canonical_time")
+        assert result == ["seg-timed", "seg-a", "seg-z"]
+
+    def test_falls_back_to_sorted_ids_when_metadata_unavailable(self):
+        from nova_export.export.exporter import _deterministic_segment_ids
+
+        mock = MagicMock()
+        mock.segment_ids.return_value = ["c", "a", "b"]
+        mock.get_index_ranges.side_effect = RuntimeError("no manifest")
+
+        assert _deterministic_segment_ids(mock, "canonical_time") == ["a", "b", "c"]
+
+    def test_export_processes_episodes_in_recording_time_order(self):
+        """End-to-end: episode numbering follows recording start time, not
+        the order dataset.segment_ids() happened to return."""
+        config = ExportConfig(
+            fps=15,
+            action=["actions_target"],
+            cameras=[CameraSource(source="wrist")],
+        )
+        t0 = datetime(2026, 1, 1, 10, 0, 0)
+        mock_dataset = self._mock_dataset(
+            ["seg-second", "seg-first"],
+            {"seg-second": t0 + timedelta(minutes=1), "seg-first": t0},
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "output"
+            with (
+                patch("nova_export.export.exporter.CatalogClient") as mock_client_cls,
+                patch("nova_export.export.exporter._validate_sources"),
+                patch(
+                    "nova_export.export.episode_sampler.EpisodeSampler._process_segment",
+                    return_value=create_test_episode(num_samples=5, fps=15),
+                ) as mock_process,
+                patch(
+                    "lerobot.datasets.lerobot_dataset.LeRobotDataset"
+                ) as mock_lerobot_cls,
+            ):
+                mock_client_cls.return_value.get_dataset.return_value = mock_dataset
+                mock_lerobot_cls.create.return_value = MagicMock(
+                    num_episodes=2, num_frames=10
+                )
+
+                export_recordings(
+                    output_dir=output_dir,
+                    config=config,
+                    dataset_name="d",
+                    catalog_url="http://fake",
+                )
+
+            processed = [call.args[0] for call in mock_process.call_args_list]
+            assert processed == ["seg-first", "seg-second"]
+
+
+# =============================================================================
 # Camera Resize (configured via export config JSON)
 # =============================================================================
 

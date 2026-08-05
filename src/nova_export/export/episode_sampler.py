@@ -119,7 +119,11 @@ class EpisodeSampler:
         """
         self.config = config
         self.dataset = dataset
-        self.segment_ids = segment_ids or dataset.segment_ids()
+        # dataset.segment_ids() order is not stable across server runs; sort
+        # the fallback so standalone use yields deterministic episode indices.
+        self.segment_ids = (
+            list(segment_ids) if segment_ids else sorted(dataset.segment_ids())
+        )
 
         self._video_decoders: dict[str, VideoDecoder] = {}
         self._target_sizes: dict[str, tuple[int, int] | None] = {}
