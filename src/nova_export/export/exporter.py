@@ -130,6 +130,42 @@ def _raw_segment_duration_s(index_ranges, segment_id: str, index_column: str) ->
         return None
 
 
+def _deterministic_segment_ids(dataset, index_column: str) -> list[str]:
+    """Return the dataset's segment IDs in a deterministic order.
+
+    `dataset.segment_ids()` reflects internal server state and can return the
+    same segments in a different order across runs (observed with the local
+    in-process server over identical .rrd files), which would shuffle episode
+    numbering in the exported dataset. Order segments by their recording start
+    time (a cheap manifest-metadata read via `get_index_ranges()`) so episodes
+    follow recording time, with the segment ID as tie-breaker. Segments whose
+    start time can't be read sort last, by ID; if the metadata is unavailable
+    entirely, the result is plain lexicographic ID order — still deterministic.
+    """
+    ids = [str(s) for s in dataset.segment_ids()]
+
+    starts: dict[str, float] = {}
+    try:
+        table = (
+            dataset.get_index_ranges()
+            .select("rerun_segment_id", f"{index_column}:start")
+            .to_arrow_table()
+        )
+        for seg, start in zip(
+            table["rerun_segment_id"], table[f"{index_column}:start"]
+        ):
+            start_py = start.as_py()
+            if start_py is not None:
+                # Epoch floats compare fine across naive/aware datetimes.
+                starts[str(seg.as_py())] = start_py.timestamp()
+    except Exception as e:
+        logger.debug(
+            "Could not read segment start times; ordering by segment ID only: {}", e
+        )
+
+    return sorted(ids, key=lambda s: (starts.get(s, float("inf")), s))
+
+
 def _validate_sources(dataset, config: ExportConfig, segment_id: str) -> None:
     """Preflight-check configured sources against the recording's schema.
 
@@ -275,7 +311,9 @@ def export_recordings(
         dataset_name: Name of the dataset (in the catalog, or assigned to the temp server).
         catalog_url: URL of an external Rerun catalog server.
         rrd_paths: Local `.rrd` recording files (used when catalog_url is unset).
-        segment_ids: Optional subset of segment IDs to export.
+        segment_ids: Optional subset of segment IDs to export, in the given
+            order. When omitted, all segments are exported ordered by
+            recording start time (deterministic across runs).
         progress_callback: Optional callback(current, total) called after each episode.
         abort_callback: Optional callback that returns True if export should be aborted.
 
@@ -295,8 +333,15 @@ def export_recordings(
     )
 
     with _open_dataset(dataset_name, catalog_url, rrd_paths) as dataset:
-        # Determine segments to export
-        all_segment_ids = list(segment_ids) if segment_ids else dataset.segment_ids()
+        # Determine segments to export. Explicit `segment_ids` keep the caller's
+        # order; discovered segments get a deterministic order (recording start
+        # time, then ID) because dataset.segment_ids() is not stable across
+        # server runs — see _deterministic_segment_ids.
+        all_segment_ids = (
+            list(segment_ids)
+            if segment_ids
+            else _deterministic_segment_ids(dataset, config.index_column)
+        )
         if not all_segment_ids:
             raise ValueError("No segments found in the recordings.")
 
