@@ -411,9 +411,19 @@ class EpisodeSampler:
             col(action_columns[0]).is_not_null()
         ).select("rerun_segment_id", self.config.index_column)
 
-        # Select columns
-        columns = [self.config.index_column, *action_columns]
-        columns.extend(self.config.state_columns())
+        # Select columns, deduplicated: a source configured as both action and
+        # state must be selected once — DataFusion rejects duplicate projection
+        # names. Extraction below looks columns up by name, so both action and
+        # state reuse the single result column.
+        columns = list(
+            dict.fromkeys(
+                [
+                    self.config.index_column,
+                    *action_columns,
+                    *self.config.state_columns(),
+                ]
+            )
+        )
 
         # Query with fill_latest_at
         reader = view.reader(

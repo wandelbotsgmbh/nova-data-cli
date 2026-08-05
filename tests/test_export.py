@@ -622,6 +622,86 @@ class TestEpisodeSamplerHelpers:
                 assert sample.state[0] == float(i) * 2
 
 
+class TestOverlappingActionState:
+    """A source configured as both action and state is selected only once.
+
+    DataFusion rejects duplicate projection names ("Projections require unique
+    expression names"), so the query must deduplicate columns and reuse the
+    single result column for both the action and state vectors.
+    """
+
+    INDEX_COLUMN = "canonical_time"
+    SCALAR_COLUMN = "/joint_positions:Scalars:scalars"
+
+    def _make_sampler(self) -> tuple[EpisodeSampler, MagicMock]:
+        """Build a sampler whose dataset mock enforces DataFusion's
+        unique-projection rule on select()."""
+        config = ExportConfig(
+            fps=10,
+            index_column=self.INDEX_COLUMN,
+            action=["joint_positions"],
+            state=["joint_positions"],
+        )
+
+        result_table = pa.table(
+            {
+                self.INDEX_COLUMN: pa.array([0, 100_000_000], type=pa.int64()),
+                self.SCALAR_COLUMN: pa.array(
+                    [[1.0, 2.0], [3.0, 4.0]], type=pa.list_(pa.float64())
+                ),
+            }
+        )
+
+        def select(*columns):
+            if len(columns) != len(set(columns)):
+                raise Exception(
+                    "Error during planning: Projections require unique "
+                    f"expression names but the expression {columns} appears "
+                    "multiple times"
+                )
+            select_result = MagicMock()
+            select_result.to_arrow_table.return_value = result_table
+            return select_result
+
+        query_reader = MagicMock()
+        query_reader.select.side_effect = select
+
+        base_reader = MagicMock()
+        base_reader.filter.return_value.select.return_value = MagicMock()
+
+        def reader(**kwargs):
+            return query_reader if "using_index_values" in kwargs else base_reader
+
+        view = MagicMock()
+        view.reader.side_effect = reader
+
+        dataset = MagicMock()
+        dataset.filter_segments.return_value = view
+
+        sampler = EpisodeSampler(config=config, dataset=dataset, segment_ids=["seg"])
+        return sampler, query_reader
+
+    def test_duplicate_source_queried_once_and_shared(self):
+        sampler, query_reader = self._make_sampler()
+        time_grid = np.array([0, 100_000_000], dtype=np.int64)
+
+        data = sampler._query_action_state("seg", time_grid)
+
+        assert data is not None
+        selected = query_reader.select.call_args[0]
+        assert list(selected) == [self.INDEX_COLUMN, self.SCALAR_COLUMN]
+
+        # The single result column feeds both the action and state vectors
+        assert np.array_equal(data[0]["action"], np.array([1.0, 2.0], dtype=np.float32))
+        assert np.array_equal(data[0]["state"], np.array([1.0, 2.0], dtype=np.float32))
+        assert np.array_equal(
+            data[100_000_000]["action"], np.array([3.0, 4.0], dtype=np.float32)
+        )
+        assert np.array_equal(
+            data[100_000_000]["state"], np.array([3.0, 4.0], dtype=np.float32)
+        )
+
+
 # =============================================================================
 # Source validation (helpful error when a config source is missing)
 # =============================================================================
