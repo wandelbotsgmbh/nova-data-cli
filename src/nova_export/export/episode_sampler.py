@@ -2,7 +2,7 @@
 
 This layer handles:
 - Building a fixed-rate time grid at target FPS
-- Sampling video frames from decoded caches
+- Sampling video frames at grid timestamps (decoded streaming, grid-aligned)
 - Querying action/state data at grid timestamps
 - Combining into unified Sample objects
 
@@ -15,13 +15,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator
 
-import av
 import numpy as np
 import numpy.typing as npt
 from loguru import logger
 from tqdm import tqdm
 
-from nova_export.export.video_decoder import FrameCache, VideoDecoder
+from nova_export.export.video_decoder import (
+    FrameCache,
+    PacketSeries,
+    VideoDecoder,
+    resize_rgb,
+)
 
 if TYPE_CHECKING:
     from nova_export.export.config import ExportConfig
@@ -90,13 +94,14 @@ class EpisodeSampler:
     """Samples episodes at fixed FPS from Rerun recordings.
 
     Pipeline:
-    1. For each segment, decode all video streams into frame caches
+    1. For each segment, load each video stream's compressed packets (no decode)
     2. Find the valid time range where all streams have data
     3. Build a time grid at target FPS
-    4. For each grid timestamp:
-       - Sample nearest video frame from each cache
-       - Query action/state via fill_latest_at
-       - Combine into a Sample
+    4. Query action/state via fill_latest_at
+    5. Decode each video stream once, keeping only the frames nearest to the
+       grid timestamps (already resized) — full-resolution frames are never
+       accumulated in memory
+    6. Combine into Sample objects
     """
 
     def __init__(
@@ -168,25 +173,31 @@ class EpisodeSampler:
         Returns:
             Episode with all samples, or None if processing failed.
         """
-        # Step 1: Decode all video streams
-        frame_caches: dict[str, FrameCache] = {}
+        # Step 1: Load compressed video packets for all streams (no decode yet).
+        # This gives each stream's time bounds cheaply, so the time grid can be
+        # fixed *before* decoding and only grid-aligned frames are ever kept.
+        packet_series: dict[str, PacketSeries] = {}
         for cam in self.config.cameras:
             entity_path = self.config._normalize_path(cam.source)
-            cache = self._video_decoders[cam.source].decode_segment(
+            series = self._video_decoders[cam.source].load_packets(
                 dataset=self.dataset,
                 segment_id=segment_id,
                 video_entity=entity_path,
                 index_column=self.config.index_column,
             )
-            if cache.num_frames == 0:
+            if series.num_packets == 0:
                 logger.warning(
                     "No video frames for {} in segment {}", cam.source, segment_id[:8]
                 )
                 return None
-            frame_caches[cam.source] = cache
+            packet_series[cam.source] = series
 
         # Step 2: Find valid time range (intersection of all streams)
-        valid_range = self._find_valid_range(segment_id, frame_caches)
+        stream_bounds = {
+            name: (series.start_ns, series.end_ns)
+            for name, series in packet_series.items()
+        }
+        valid_range = self._find_valid_range(segment_id, stream_bounds)
         if valid_range is None:
             return None
 
@@ -207,7 +218,24 @@ class EpisodeSampler:
         if action_state_data is None:
             return None
 
-        # Step 5: Combine into samples
+        # Step 5: Decode each stream, keeping only grid-aligned (resized) frames
+        frame_caches: dict[str, FrameCache] = {}
+        for cam in self.config.cameras:
+            cache = self._video_decoders[cam.source].decode_at(
+                packet_series.pop(cam.source),
+                time_grid,
+                target_size=self._target_sizes[cam.source],
+            )
+            if cache.num_frames == 0:
+                logger.warning(
+                    "No video frames decoded for {} in segment {}",
+                    cam.source,
+                    segment_id[:8],
+                )
+                return None
+            frame_caches[cam.source] = cache
+
+        # Step 6: Combine into samples
         samples = self._build_samples(time_grid, frame_caches, action_state_data)
 
         return Episode(
@@ -219,24 +247,24 @@ class EpisodeSampler:
     def _find_valid_range(
         self,
         segment_id: str,
-        frame_caches: dict[str, FrameCache],
+        stream_bounds: dict[str, tuple[int, int]],
     ) -> tuple[int, int] | None:
         """Find the time range where all streams have data.
 
         Args:
             segment_id: Segment ID.
-            frame_caches: Decoded frame caches for each camera.
+            stream_bounds: Per-camera (start_ns, end_ns) video stream bounds.
 
         Returns:
             (start_ns, end_ns) tuple, or None if no valid overlap.
         """
         from datafusion import col
 
-        # Start with video cache bounds. With no cameras, start unbounded and let
-        # action availability (and trimming) define the range.
-        if frame_caches:
-            valid_start_ns = max(cache.start_ns for cache in frame_caches.values())
-            valid_end_ns = min(cache.end_ns for cache in frame_caches.values())
+        # Start with video stream bounds. With no cameras, start unbounded and
+        # let action availability (and trimming) define the range.
+        if stream_bounds:
+            valid_start_ns = max(start for start, _ in stream_bounds.values())
+            valid_end_ns = min(end for _, end in stream_bounds.values())
         else:
             valid_start_ns = -(2**63)
             valid_end_ns = 2**63 - 1
@@ -555,16 +583,15 @@ class EpisodeSampler:
                     all_images_ok = False
                     break
 
-                # Resize frame if target size specified in config.
-                # Use PyAV (libswscale) rather than OpenCV so we don't load a
-                # second ffmpeg/libavdevice and clash with av's (macOS objc warning).
+                # Resize frame if target size specified in config. Frames from
+                # decode_at() arrive already resized, so this is a no-op there;
+                # it still applies when given a raw full-resolution cache.
                 target_size = self._target_sizes.get(cam_name)
-                if target_size is not None:
-                    vf = av.VideoFrame.from_ndarray(
-                        np.ascontiguousarray(frame), format="rgb24"
-                    )
-                    vf = vf.reformat(width=target_size[0], height=target_size[1])
-                    frame = vf.to_ndarray(format="rgb24")
+                if target_size is not None and (
+                    frame.shape[1],
+                    frame.shape[0],
+                ) != target_size:
+                    frame = resize_rgb(frame, *target_size)
 
                 images[cam_name] = frame
 
@@ -584,17 +611,9 @@ class EpisodeSampler:
 
     def _extract_timestamps_ns(self, ts_column: Any) -> npt.NDArray[np.int64]:
         """Extract timestamps from PyArrow column as nanosecond integers."""
-        timestamps = []
-        for chunk in ts_column.chunks:
-            for val in chunk:
-                ts = val.as_py()
-                if isinstance(ts, (int, float)):
-                    timestamps.append(int(ts))
-                elif hasattr(ts, "value"):
-                    timestamps.append(int(ts.value))
-                else:
-                    timestamps.append(int(ts))
-        return np.array(timestamps, dtype=np.int64)
+        from nova_export.export.video_decoder import extract_timestamps_ns
+
+        return extract_timestamps_ns(ts_column)
 
     def _extract_scalars(
         self, col: Any, row_idx: int

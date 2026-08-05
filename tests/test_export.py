@@ -36,9 +36,13 @@ from nova_export.export.heads.base import ExportResult
 from nova_export.export.heads.lerobot import LeRobotHead
 from nova_export.export.video_decoder import (
     FrameCache,
+    PacketSeries,
     VideoDecoder,
     _avcc_to_annex_b,
+    _flatten_blob,
     _is_annex_b,
+    extract_timestamps_ns,
+    resize_rgb,
 )
 
 # =============================================================================
@@ -304,6 +308,135 @@ class TestVideoDecoder:
 
         assert len(frames_decoded) == 5, f"Expected 5 frames, got {len(frames_decoded)}"
         assert frames_decoded[0].shape == (64, 64, 3)
+
+
+def packets_to_series(
+    packets: list[tuple[bytes, int]], entity: str = "/wrist"
+) -> PacketSeries:
+    """Wrap (packet_bytes, timestamp_ns) tuples in a PacketSeries.
+
+    Uses the same Arrow layout Rerun produces for video samples
+    (list<list<uint8>>), so the blob-flattening fast path is exercised too.
+    """
+    timestamps = np.array([ts for _, ts in packets], dtype=np.int64)
+    video_column = f"{entity}:VideoStream:sample"
+    blob_type = pa.list_(pa.list_(pa.uint8()))
+    blobs = pa.array([[list(b)] for b, _ in packets], type=blob_type)
+    table = pa.table(
+        {
+            "canonical_time": pa.array(timestamps, type=pa.int64()),
+            video_column: blobs,
+        }
+    )
+    return PacketSeries(
+        table=table,
+        timestamps_ns=timestamps,
+        video_column=video_column,
+        entity=entity,
+    )
+
+
+class TestDecodeAt:
+    """decode_at must select exactly the frames get_frame_at would select."""
+
+    def _full_cache(self, decoder: VideoDecoder, series: PacketSeries) -> FrameCache:
+        """Decode everything (reference behavior of decode_segment)."""
+        frames, ts = [], []
+        for frame, t in decoder._iter_frames(series):
+            frames.append(frame)
+            ts.append(t)
+        return FrameCache(frames=frames, timestamps_ns=np.array(ts, dtype=np.int64))
+
+    def test_parity_with_full_decode(self):
+        """Grid frames match a full decode + nearest lookup, byte for byte."""
+        packets = create_test_h264_packets(width=64, height=64, num_frames=20, fps=30)
+        series = packets_to_series(packets)
+
+        full_cache = self._full_cache(VideoDecoder(), series)
+        assert full_cache.num_frames >= 20
+
+        # Off-phase grid (odd offset, different rate) incl. points beyond both ends
+        start = full_cache.start_ns - 40_000_000
+        end = full_cache.end_ns + 40_000_000
+        grid = np.arange(start + 7_777, end, int(1e9 / 12), dtype=np.int64)
+
+        aligned = VideoDecoder().decode_at(series, grid)
+
+        assert aligned.num_frames == len(grid)
+        assert np.array_equal(aligned.timestamps_ns, grid)
+        for i, ts in enumerate(grid):
+            expected = full_cache.get_frame_at(int(ts))
+            assert np.array_equal(aligned.frames[i], expected), f"mismatch at {i}"
+
+    def test_resize_applied_to_selected_frames(self):
+        """decode_at resizes selected frames to (width, height)."""
+        packets = create_test_h264_packets(width=64, height=64, num_frames=10, fps=30)
+        series = packets_to_series(packets)
+
+        full_cache = self._full_cache(VideoDecoder(), series)
+        grid = np.linspace(
+            full_cache.start_ns, full_cache.end_ns, 7, dtype=np.int64
+        )
+
+        aligned = VideoDecoder().decode_at(series, grid, target_size=(32, 48))
+
+        for i, ts in enumerate(grid):
+            assert aligned.frames[i].shape == (48, 32, 3)
+            expected = resize_rgb(full_cache.get_frame_at(int(ts)), 32, 48)
+            assert np.array_equal(aligned.frames[i], expected)
+
+    def test_repeated_targets_share_frame(self):
+        """Targets mapping to one source frame reuse the same array (no copies)."""
+        packets = create_test_h264_packets(width=64, height=64, num_frames=5, fps=30)
+        series = packets_to_series(packets)
+
+        # Grid much denser than the video → adjacent targets share frames
+        grid = np.arange(0, int(4 * 1e9 / 30), int(1e9 / 120), dtype=np.int64)
+        aligned = VideoDecoder().decode_at(series, grid)
+
+        unique_ids = {id(f) for f in aligned.frames}
+        assert len(unique_ids) <= 5
+
+    def test_empty_targets(self):
+        """An empty grid yields an empty (but valid) cache."""
+        packets = create_test_h264_packets(width=64, height=64, num_frames=5, fps=30)
+        series = packets_to_series(packets)
+
+        aligned = VideoDecoder().decode_at(series, np.array([], dtype=np.int64))
+        assert aligned.num_frames == 0
+
+    def test_undecodable_packets_give_empty_cache(self):
+        """Garbage packets decode to nothing → empty cache signals failure."""
+        packets = [(b"\x00\x00\x00\x01\xff\xff", i * 1000) for i in range(3)]
+        series = packets_to_series(packets)
+
+        aligned = VideoDecoder().decode_at(series, np.array([0, 1000], dtype=np.int64))
+        assert aligned.num_frames == 0
+
+
+class TestBlobAndTimestampHelpers:
+    """Vectorized Arrow helpers must round-trip exactly."""
+
+    def test_flatten_blob_nested_list(self):
+        data = [b"\x00\x01\x02\xff", b"", b"\x42" * 100]
+        arr = pa.array([[list(b)] for b in data], type=pa.list_(pa.list_(pa.uint8())))
+        for i, expected in enumerate(data):
+            assert _flatten_blob(arr, i) == expected
+
+    def test_flatten_blob_flat_list(self):
+        data = [b"\x10\x20", b"\x99"]
+        arr = pa.array([list(b) for b in data], type=pa.list_(pa.uint8()))
+        for i, expected in enumerate(data):
+            assert _flatten_blob(arr, i) == expected
+
+    def test_extract_timestamps_int64(self):
+        col = pa.chunked_array([pa.array([1, 2, 3], type=pa.int64())])
+        assert np.array_equal(extract_timestamps_ns(col), [1, 2, 3])
+
+    def test_extract_timestamps_datetime(self):
+        ns = [1_000, 2_000_000, 3_000_000_000]
+        col = pa.chunked_array([pa.array(ns, type=pa.timestamp("ns"))])
+        assert np.array_equal(extract_timestamps_ns(col), ns)
 
 
 # =============================================================================

@@ -460,6 +460,10 @@ def export_recordings(
                     if progress_callback:
                         progress_callback(episode_count, len(all_segment_ids))
 
+                # Drop the episode's frames now — otherwise they stay alive
+                # while the next segment is decoded, doubling peak memory.
+                del episode
+
             except Exception as e:
                 error_msg = str(e)
                 logger.error(
