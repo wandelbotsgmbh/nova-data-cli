@@ -12,6 +12,7 @@ Decodes video packets in order (no keyframe hunting). Two modes:
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -124,6 +125,34 @@ class PacketSeries:
     def num_packets(self) -> int:
         return len(self.timestamps_ns)
 
+    @functools.cached_property
+    def first_decodable_ns(self) -> int:
+        """Timestamp of the first keyframe packet.
+
+        Real streams often start mid-GOP: packets before the first keyframe
+        reference an SPS/PPS the decoder hasn't seen and produce no frames, so
+        the stream's *usable* range starts here, not at the first packet. Only
+        the leading packets are inspected — the scan stops at the first hit.
+        """
+        if self.num_packets == 0:
+            return 0
+        video_col = self.table[self.video_column].combine_chunks()
+        for i in range(self.num_packets):
+            packet_bytes = _flatten_blob(video_col, i)
+            if packet_bytes and _contains_idr(packet_bytes):
+                if i > 0:
+                    logger.debug(
+                        "{}: stream starts mid-GOP, first keyframe at packet {} "
+                        "({:.1f} ms after first packet)",
+                        self.entity,
+                        i,
+                        (int(self.timestamps_ns[i]) - self.start_ns) / 1e6,
+                    )
+                return int(self.timestamps_ns[i])
+        # No keyframe found — nothing will decode; downstream handles the
+        # resulting empty cache.
+        return self.start_ns
+
     @property
     def start_ns(self) -> int:
         """Timestamp of the first packet in nanoseconds."""
@@ -155,6 +184,38 @@ def _avcc_to_annex_b(data: bytes) -> bytes:
         result.extend(data[pos : pos + nalu_len])
         pos += nalu_len
     return bytes(result)
+
+
+def _contains_idr(packet: bytes) -> bool:
+    """Check whether an H.264 packet contains an IDR slice (NAL type 5).
+
+    Handles both Annex B (start-code prefixed) and AVCC (length-prefixed)
+    packaging. Decoding can only start at an IDR, so the first packet for
+    which this is true marks the stream's first decodable frame.
+    """
+    if _is_annex_b(packet):
+        pos = 0
+        n = len(packet)
+        while True:
+            pos = packet.find(b"\x00\x00\x01", pos)
+            if pos < 0 or pos + 3 >= n:
+                return False
+            nal_type = packet[pos + 3] & 0x1F
+            if nal_type == 5:
+                return True
+            pos += 3
+    else:
+        pos = 0
+        n = len(packet)
+        while pos + 4 < n:
+            nalu_len = int.from_bytes(packet[pos : pos + 4], "big")
+            pos += 4
+            if nalu_len <= 0 or pos + nalu_len > n:
+                return False
+            if packet[pos] & 0x1F == 5:
+                return True
+            pos += nalu_len
+        return False
 
 
 def _flatten_blob_slow(combined_array: Any, row_idx: int) -> bytes:

@@ -196,9 +196,11 @@ class EpisodeSampler:
                 return None
             packet_series[cam.source] = series
 
-        # Step 2: Find valid time range (intersection of all streams)
+        # Step 2: Find valid time range (intersection of all streams).
+        # A stream's usable range starts at its first keyframe — leading
+        # mid-GOP packets can't be decoded and must not stretch the episode.
         stream_bounds = {
-            name: (series.start_ns, series.end_ns)
+            name: (series.first_decodable_ns, series.end_ns)
             for name, series in packet_series.items()
         }
         valid_range = self._find_valid_range(segment_id, stream_bounds)

@@ -414,6 +414,57 @@ class TestDecodeAt:
         assert aligned.num_frames == 0
 
 
+class TestMidGopStart:
+    """Streams that start mid-GOP (as live camera recordings do) must not
+    stretch the episode before the first decodable frame."""
+
+    def _mid_gop_series(self) -> PacketSeries:
+        # gop_size=5 → keyframes at frames 0, 5, 10, 15. Dropping the first
+        # two packets leaves a stream that starts with undecodable P-frames.
+        packets = create_test_h264_packets(width=64, height=64, num_frames=20, fps=30)
+        return packets_to_series(packets[2:])
+
+    def test_first_decodable_matches_first_decoded_frame(self):
+        """first_decodable_ns equals the timestamp of the first frame a full
+        decode actually produces (the first keyframe)."""
+        series = self._mid_gop_series()
+        decoder = VideoDecoder()
+
+        frame_ts = [ts for _, ts in decoder._iter_frames(series)]
+        assert frame_ts, "expected the stream to recover at the next keyframe"
+
+        assert series.first_decodable_ns == frame_ts[0]
+        assert series.first_decodable_ns > series.start_ns
+
+    def test_clean_stream_first_decodable_is_first_packet(self):
+        """A stream starting on a keyframe is decodable from the first packet."""
+        packets = create_test_h264_packets(width=64, height=64, num_frames=5, fps=30)
+        series = packets_to_series(packets)
+        assert series.first_decodable_ns == series.start_ns
+
+    def test_decode_at_parity_on_mid_gop_stream(self):
+        """Grid selection over a mid-GOP stream matches a full decode."""
+        series = self._mid_gop_series()
+        decoder = VideoDecoder()
+
+        frames, ts = [], []
+        for frame, t in decoder._iter_frames(series):
+            frames.append(frame)
+            ts.append(t)
+        full_cache = FrameCache(
+            frames=frames, timestamps_ns=np.array(ts, dtype=np.int64)
+        )
+
+        grid = np.arange(
+            series.first_decodable_ns, series.end_ns + 1, int(1e9 / 15), dtype=np.int64
+        )
+        aligned = VideoDecoder().decode_at(series, grid)
+
+        assert aligned.num_frames == len(grid)
+        for i, t in enumerate(grid):
+            assert np.array_equal(aligned.frames[i], full_cache.get_frame_at(int(t)))
+
+
 class TestBlobAndTimestampHelpers:
     """Vectorized Arrow helpers must round-trip exactly."""
 
