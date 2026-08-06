@@ -152,6 +152,23 @@ keeps this from monopolizing CPU/disk even without an active watchdog for
 those resources — it tells the kernel to prefer any other process, so the
 pipeline only consumes spare capacity.
 
+## "Nothing left" needs confirmation, not a single scan
+
+A worker exits when it finds no candidates *and* `COLLECTION_DONE` exists; the
+supervisor's drain loop proceeds to merge on the same condition. Both used to
+trust a single scan of `list_candidates` for this — but a scan can come back
+empty transiently (observed in production under heavy system load, likely a
+`find` subprocess failing to fork while several CPU-heavy `nova-data-cli`
+decodes were competing for cores; see
+`docs/investigations/worker-early-exit.md`), and there was no tolerance for
+that before treating it as final. A false-empty scan for a worker silently
+drops it for the rest of the run (throughput loss, no error); the same false
+reading in the supervisor's drain loop would be worse — merging before
+everything's actually exported. Both now require repeated confirmation (3
+consecutive empty scans for a worker, 2 consecutive clean passes for the
+supervisor) before trusting it, the same principle `role_acquire`'s
+idle-detection already applied.
+
 ## Merge
 
 `merge_batches.py` merges via `lerobot.datasets.aggregate.aggregate_datasets`,

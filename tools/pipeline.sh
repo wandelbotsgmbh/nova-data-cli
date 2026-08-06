@@ -272,6 +272,7 @@ attempt_batch() {
 
 role_worker() {
   WORKER_IDX="$1"
+  local empty_scans=0
   while true; do
     rebuild_done
     wait_for_memory
@@ -299,14 +300,23 @@ role_worker() {
     fi
 
     if [[ ${#claimed[@]} -eq 0 ]]; then
-      if [[ -f "$COLLECTION_DONE" ]]; then
-        log "no candidates and collection done, exiting"
+      # A single empty scan can be a transient glitch (e.g. under heavy
+      # system load), not proof there's no more work — require 3 consecutive
+      # empty scans before treating "collection done" as "exit for good",
+      # the same way acquire's idle-detection needs sustained evidence rather
+      # than a single reading. A false-empty scan just wastes 30s here; a
+      # false-permanent worker exit silently cuts throughput for the rest of
+      # the run.
+      empty_scans=$((empty_scans + 1))
+      if [[ -f "$COLLECTION_DONE" && $empty_scans -ge 3 ]]; then
+        log "no candidates across 3 consecutive scans and collection done, exiting"
         return 0
       fi
       sleep 30
       continue
     fi
 
+    empty_scans=0
     attempt_batch "${claimed[@]}"
   done
 }
@@ -362,25 +372,67 @@ role_supervisor() {
   wait "$acquire_pid" || true
   wait "${worker_pids[@]}" || true
 
-  # Drain: relaunch until a pass finds nothing left (see AGENT.md).
-  while true; do
+  # Drain: relaunch until 2 consecutive passes find nothing left (see
+  # AGENT.md) — a single clean scan could be a transient glitch, and trusting
+  # it alone here risks merging before everything's actually exported, not
+  # just losing a worker the way role_worker's equivalent check would.
+  local drained_scans=0
+  while [[ $drained_scans -lt 2 ]]; do
     rebuild_done
     if [[ -z "$(list_candidates | head -1)" ]] && [[ -z "$(ls -A "$CLAIMED" 2>/dev/null)" ]]; then
-      break
+      drained_scans=$((drained_scans + 1))
+      sleep 5
+      continue
     fi
+    drained_scans=0
     log "drain pass found leftover work, relaunching workers"
     spawn_workers
     wait "${worker_pids[@]}" || true
   done
 
   local -a batch_dirs=("$EXPORT_ROOT"/batch_*)
-  [[ ${#batch_dirs[@]} -gt 0 ]] || { log "no batches produced, nothing to merge"; return 0; }
+  if [[ ${#batch_dirs[@]} -eq 0 ]]; then
+    log "no batches produced, nothing to merge"
+    print_report
+    [[ -n "$(ls -A "$QUARANTINE" 2>/dev/null)" ]] && exit 1
+    return 0
+  fi
 
   log "all workers drained, merging"
   (cd "$NOVA_CLI_DIR" && uv run python tools/merge_batches.py \
     --batches-root "$EXPORT_ROOT" \
     --output "${EXPORT_ROOT}_merged")
   log "done: ${EXPORT_ROOT}_merged"
+  print_report
+  [[ -n "$(ls -A "$QUARANTINE" 2>/dev/null)" ]] && exit 1
+  return 0
+}
+
+# recordings found vs. exported vs. quarantined, and episodes in the merged
+# dataset (not the same number — one recording can yield several episodes).
+print_report() {
+  local total=0
+  local d
+  for d in "$WATCH_DIR"/*/; do
+    [[ -f "${d}recording.rrd" ]] && total=$((total + 1))
+  done
+  rebuild_done
+  local exported=${#DONE_IDS[@]}
+  local -a quarantined_ids=("$QUARANTINE"/*)
+  local quarantined_n=${#quarantined_ids[@]}
+
+  log "=== report ==="
+  log "recordings found:     $total"
+  log "exported:              $exported"
+  log "quarantined (3x fail): $quarantined_n"
+  if [[ $quarantined_n -gt 0 ]]; then
+    log "quarantined IDs: $(basename -a "${quarantined_ids[@]}" | tr '\n' ' ')"
+  fi
+  if [[ -f "${EXPORT_ROOT}_merged/meta/info.json" ]]; then
+    local episodes
+    episodes="$(python3 -c "import json;print(json.load(open('${EXPORT_ROOT}_merged/meta/info.json'))['total_episodes'])" 2>/dev/null || echo "?")"
+    log "episodes in merged dataset: $episodes"
+  fi
 }
 
 case "$ROLE" in
