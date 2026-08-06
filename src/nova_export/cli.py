@@ -26,6 +26,7 @@ Formats (set via the config's "format" field):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -202,6 +203,24 @@ def main() -> None:
         result.num_episodes,
         result.num_frames,
         result.output_dir,
+    )
+
+    # Machine-readable per-invocation outcome (keyed by segment, not recording;
+    # see tools/AGENT.md for how callers work around that).
+    metadata = result.metadata or {}
+    (args.output / "export_summary.json").write_text(
+        json.dumps(
+            {
+                "total_episodes_attempted": metadata.get("total_episodes_attempted", 0),
+                "successful_episodes": metadata.get("successful_episodes", 0),
+                "skipped_episodes": metadata.get("skipped_episodes", 0),
+                "failed_episodes": metadata.get("failed_episodes", 0),
+                "successful_list": metadata.get("successful_list", []),
+                "skipped_list": metadata.get("skipped_list", []),
+                "failed_list": metadata.get("failed_list", []),
+            },
+            indent=2,
+        )
     )
 
     if config.format == "groot":

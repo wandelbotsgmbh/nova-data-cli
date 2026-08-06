@@ -43,29 +43,37 @@ cameras. Examples: [`examples/`](examples/). Schema:
 config field, the export formats, camera resizing, and how the trimming modes
 choose episode boundaries (with figures).
 
-## Live sync + export (`tools/sync_loop.sh`)
+## Live sync + parallel export (`tools/pipeline.sh`)
 
-Pulls recordings from a remote machine while collection is still running there,
-and exports them in the background as each one completes — instead of waiting
-for collection to finish before exporting anything.
+Pulls recordings while collection is still running and exports them in
+parallel as they finish, instead of waiting for collection to end and then
+exporting one at a time. Worker count and memory budget are computed from the
+machine's own RAM/cores at startup. See [`tools/AGENT.md`](tools/AGENT.md) for
+the full design (crash-safety, bisection, why it's shaped this way).
 
-- **Two machines (collector + this one):** requires passwordless SSH to the
-  remote host (`ssh-copy-id`), since the script polls it every `POLL_SECONDS`
-  via `rsync`/`ssh`. Edit `REMOTE_HOST`, `REMOTE_DIRS`, and `LOCAL_DEST` at the
-  top of the script first.
-- **Same machine:** SSH isn't needed if collection and export run on one box —
-  point `REMOTE_DIRS`/`LOCAL_DEST` at local paths and swap `sync_once`'s
-  `rsync` for a local copy (or skip syncing and export straight from the
-  collection dir). Not built yet; the script currently assumes a remote host.
-- The script stops polling once the remote dir has been idle for
-  `IDLE_MINUTES`, does one final sync + export pass, then merges all batches
-  into one LeRobot dataset via `tools/merge_batches.py` (nova-data-cli itself
-  has no incremental/append mode, so each batch is a separate `--output` dir
-  until merged).
+**Two machines** (collector elsewhere, export runs here) — needs passwordless
+SSH to the collector (`ssh-copy-id`):
 
 ```bash
-tools/sync_loop.sh
+tools/pipeline.sh                    # default: --mode remote
 ```
+
+Edit `REMOTE_HOST`/`REMOTE_DIRS`/`WATCH_DIR` at the top of the script, or
+override per-run via `PIPELINE_REMOTE_HOST`, `PIPELINE_REMOTE_DIRS`, etc.
+(every config value is a `PIPELINE_*` env var — see the top of the script).
+
+**One machine** (collection already finished, or writing straight into a
+local dir) — no network involved:
+
+```bash
+PIPELINE_MODE=local PIPELINE_WATCH_DIR=/path/to/recordings tools/pipeline.sh
+```
+
+Both modes end the same way: once nothing new has shown up for
+`PIPELINE_IDLE_MINUTES` (or immediately, for a backlog that was never live),
+it merges every batch into one dataset at `<EXPORT_ROOT>_merged`. Restarting
+after a crash/kill is always safe — already-exported recordings are never
+redone.
 
 ## Tests
 
