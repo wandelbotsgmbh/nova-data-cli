@@ -43,6 +43,30 @@ cameras. Examples: [`examples/`](examples/). Schema:
 config field, the export formats, camera resizing, and how the trimming modes
 choose episode boundaries (with figures).
 
+## Live sync + export (`tools/sync_loop.sh`)
+
+Pulls recordings from a remote machine while collection is still running there,
+and exports them in the background as each one completes — instead of waiting
+for collection to finish before exporting anything.
+
+- **Two machines (collector + this one):** requires passwordless SSH to the
+  remote host (`ssh-copy-id`), since the script polls it every `POLL_SECONDS`
+  via `rsync`/`ssh`. Edit `REMOTE_HOST`, `REMOTE_DIRS`, and `LOCAL_DEST` at the
+  top of the script first.
+- **Same machine:** SSH isn't needed if collection and export run on one box —
+  point `REMOTE_DIRS`/`LOCAL_DEST` at local paths and swap `sync_once`'s
+  `rsync` for a local copy (or skip syncing and export straight from the
+  collection dir). Not built yet; the script currently assumes a remote host.
+- The script stops polling once the remote dir has been idle for
+  `IDLE_MINUTES`, does one final sync + export pass, then merges all batches
+  into one LeRobot dataset via `tools/merge_batches.py` (nova-data-cli itself
+  has no incremental/append mode, so each batch is a separate `--output` dir
+  until merged).
+
+```bash
+tools/sync_loop.sh
+```
+
 ## Tests
 
 ```bash
