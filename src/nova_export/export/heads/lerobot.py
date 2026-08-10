@@ -40,6 +40,7 @@ class LeRobotHead(ExportHead):
         super().__init__(config, output_dir)
         self._dataset: LeRobotDataset | None = None
         self._features: dict[str, Any] | None = None
+        self._episode_metadata_by_index: dict[int, dict[str, float]] = {}
 
     @property
     def format_name(self) -> str:
@@ -147,6 +148,15 @@ class LeRobotHead(ExportHead):
             episode.duration_s,
         )
 
+        if self.config.episode_metadata and episode.extra_metadata:
+            # LeRobot assigns its own sequential episode_index (meta.total_episodes)
+            # when save_episode() runs, which is NOT episode.episode_index (that's
+            # the exporter's raw segment-loop counter, and diverges as soon as any
+            # earlier segment is skipped). Key by the index LeRobot is about to use.
+            self._episode_metadata_by_index[self._dataset.meta.total_episodes] = (
+                episode.extra_metadata
+            )
+
         try:
             for sample in tqdm(episode.samples, desc="Frames", leave=False):
                 frame = self._sample_to_frame(sample)
@@ -172,6 +182,9 @@ class LeRobotHead(ExportHead):
         logger.info("Finalizing LeRobot dataset...")
         self._dataset.finalize()
 
+        if self.config.episode_metadata:
+            self._write_episode_metadata_columns()
+
         logger.success(
             "Dataset finalized: {} episodes, {} frames → {}",
             self._dataset.num_episodes,
@@ -189,6 +202,29 @@ class LeRobotHead(ExportHead):
                 "task": self.config.task_description,
                 "features": list(self._features.keys()) if self._features else [],
             },
+        )
+
+    def _write_episode_metadata_columns(self) -> None:
+        """Add config.episode_metadata fields as columns to meta/episodes/*.parquet.
+
+        One row per episode already exists there (episode_index, length, tasks,
+        stats, ...) — this just adds our extra columns to those existing rows,
+        rather than duplicating the values onto every per-frame row in data/.
+        """
+        import pandas as pd
+
+        episodes_files = sorted(self.output_dir.glob("meta/episodes/**/*.parquet"))
+        for path in episodes_files:
+            df = pd.read_parquet(path)
+            for field in self.config.episode_metadata:
+                df[field] = df["episode_index"].map(
+                    lambda ep: self._episode_metadata_by_index.get(ep, {}).get(field)
+                )
+            df.to_parquet(path)
+        logger.info(
+            "Added episode_metadata columns {} to {} episode metadata file(s)",
+            self.config.episode_metadata,
+            len(episodes_files),
         )
 
     def _sample_to_frame(self, sample: Sample) -> dict[str, Any]:

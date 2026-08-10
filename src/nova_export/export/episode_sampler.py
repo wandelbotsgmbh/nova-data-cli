@@ -63,6 +63,7 @@ class Episode:
     segment_id: str
     episode_index: int
     samples: list[Sample]
+    extra_metadata: dict[str, float] | None = None
 
     @property
     def num_frames(self) -> int:

@@ -7,20 +7,20 @@ shopt -s nullglob
 
 # ---- config -----------------------------------------------------------
 # Every value is overridable via a PIPELINE_* env var; see README.md.
-MODE="${PIPELINE_MODE:-remote}"
+MODE="${PIPELINE_MODE:-local}"
 REMOTE_HOST="${PIPELINE_REMOTE_HOST:-intern@172.31.11.129}"
 if [[ -n "${PIPELINE_REMOTE_DIRS:-}" ]]; then
   IFS=':' read -r -a REMOTE_DIRS <<< "$PIPELINE_REMOTE_DIRS"
 else
   REMOTE_DIRS=(
-    "/mnt/data/sebastian/raw_datasets/pick_and_place_sim_20260805_191245"
+    "/mnt/data/sebastian/raw_datasets/dryrun_pose_algo_check"
   )
 fi
-WATCH_DIR="${PIPELINE_WATCH_DIR:-/home/sebi/ws/Data/raw_data/choreo2/pick_and_place_sim_20260805_191245}"
+WATCH_DIR="${PIPELINE_WATCH_DIR:-/mnt/data/sebastian/raw_datasets/dryrun_pose_algo_check}"
 
-NOVA_CLI_DIR="${PIPELINE_NOVA_CLI_DIR:-/home/sebi/ws/nova-data-cli}"
-EXPORT_CONFIG="${PIPELINE_EXPORT_CONFIG:-/home/sebi/ws/pick_and_place_imitation_learning/data_collection/configs/lerobot_export.json}"
-EXPORT_ROOT="${PIPELINE_EXPORT_ROOT:-/home/sebi/ws/Data/choreo2_export}"
+NOVA_CLI_DIR="${PIPELINE_NOVA_CLI_DIR:-/home/intern/ws/nova-data-cli}"
+EXPORT_CONFIG="${PIPELINE_EXPORT_CONFIG:-/home/intern/ws/pick_and_place_imitation_learning/data_collection/configs/lerobot_export.json}"
+EXPORT_ROOT="${PIPELINE_EXPORT_ROOT:-/mnt/data/sebastian/lerobot_datasets/dryrun_pose_algo_check}"
 read -r -a EXPORT_CLI_CMD <<< "${PIPELINE_EXPORT_CLI:-uv run nova-data-cli}"  # swap in a stub for tests
 
 CHUNK="${PIPELINE_CHUNK:-8}"
@@ -29,8 +29,13 @@ IDLE_MINUTES="${PIPELINE_IDLE_MINUTES:-10}"
 
 # Worker count/memory cap are computed at startup from this machine's actual
 # resources, not hardcoded — tune these two, not compute_workers() below.
-MEM_TARGET_FRACTION="${PIPELINE_MEM_TARGET_FRACTION:-0.55}"
-WORKER_MEM_ESTIMATE_MB="${PIPELINE_WORKER_MEM_ESTIMATE_MB:-3200}"
+# MEM_TARGET_FRACTION caps TOTAL system memory in use (this pipeline + every
+# other process on the box), not just this pipeline's own share — a run that
+# starts alone and looks fine can still push the machine to 90%+ once other
+# jobs land on the same host, so every check below is against system-wide
+# used memory (MemTotal - MemAvailable), never just this pipeline's estimate.
+MEM_TARGET_FRACTION="${PIPELINE_MEM_TARGET_FRACTION:-0.70}"
+WORKER_MEM_ESTIMATE_MB="${PIPELINE_WORKER_MEM_ESTIMATE_MB:-5500}"
 
 STATE="${EXPORT_ROOT}/.pipeline"
 LOCK="${STATE}/lock"
@@ -66,12 +71,28 @@ fi
 
 mkdir -p "$STATE" "$CLAIMED" "$FAILED" "$QUARANTINE" "$SCRATCH" "$TMP_OUT" "$LOGS"
 
+# ---- shared helpers ------------------------------------------------------
+log() { echo "[$(date +%H:%M:%S)] [$ROLE] $*"; }
+
+mem_total_mb() { awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo; }
+
+# System-wide, not this pipeline's own usage: MemAvailable already accounts
+# for every process on the box, reclaimable cache included, so MemTotal -
+# MemAvailable is what everything combined is actually holding onto right now.
+mem_used_mb() { awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%d", (t-a)/1024}' /proc/meminfo; }
+
+# Budget in MB still free before system-wide usage hits MEM_TARGET_FRACTION
+# of total RAM. Negative means already over the target.
+mem_budget_mb() {
+  awk -v total="$(mem_total_mb)" -v used="$(mem_used_mb)" -v f="$MEM_TARGET_FRACTION" \
+    'BEGIN{printf "%d", total*f - used}'
+}
+
 # ---- resource sizing (supervisor computes once, workers inherit via env) --
 compute_workers() {
-  local mem_total_kb mem_workers core_workers
-  mem_total_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-  mem_workers="$(awk -v kb="$mem_total_kb" -v f="$MEM_TARGET_FRACTION" -v est="$WORKER_MEM_ESTIMATE_MB" \
-    'BEGIN{printf "%d", (kb/1024*f)/est}')"  # awk not $(( )): bash treats leading-zero numbers as octal
+  local mem_workers core_workers
+  mem_workers="$(awk -v budget="$(mem_budget_mb)" -v est="$WORKER_MEM_ESTIMATE_MB" \
+    'BEGIN{w=budget/est; printf "%d", (w<0)?0:w}')"  # awk not $(( )): bash treats leading-zero numbers as octal
   core_workers=$(( $(nproc) * 8 / 10 ))  # leave headroom, don't claim every core
   local workers=$mem_workers
   [[ $core_workers -lt $workers ]] && workers=$core_workers
@@ -79,21 +100,14 @@ compute_workers() {
   echo "$workers"
 }
 
-mem_available_floor_mb() {
-  awk -v est="$WORKER_MEM_ESTIMATE_MB" 'BEGIN{printf "%d", est * 1.2}'
-}
-
-# ---- shared helpers ------------------------------------------------------
-log() { echo "[$(date +%H:%M:%S)] [$ROLE] $*"; }
-
-mem_available_mb() {
-  awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo
-}
-
+# Blocks a worker from claiming its next batch while starting one more would
+# push system-wide memory (this pipeline + anything else running) past
+# MEM_TARGET_FRACTION of total RAM. Re-evaluated on every claim, not just at
+# startup, so load from unrelated processes throttles new work immediately
+# instead of only being noticed once memory is nearly exhausted.
 wait_for_memory() {
-  local floor; floor="$(mem_available_floor_mb)"
-  while [[ "$(mem_available_mb)" -lt "$floor" ]]; do
-    log "MemAvailable below ${floor}MB, waiting for headroom before claiming more work"
+  while [[ "$(mem_budget_mb)" -lt "$WORKER_MEM_ESTIMATE_MB" ]]; do
+    log "system memory usage at $(mem_used_mb)MB/$(mem_total_mb)MB (target ${MEM_TARGET_FRACTION} of total), waiting for headroom before claiming more work"
     sleep 15
   done
 }
@@ -350,8 +364,7 @@ role_supervisor() {
 
   echo "$$" > "$PGID_FILE"  # setsid above made pid == pgid
 
-  WORKERS="$(compute_workers)"
-  log "sizing: $(nproc) cores, $(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo) RAM, MEM_TARGET_FRACTION=$MEM_TARGET_FRACTION, WORKER_MEM_ESTIMATE_MB=$WORKER_MEM_ESTIMATE_MB -> WORKERS=$WORKERS"
+  log "sizing: $(nproc) cores, $(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo) RAM, MEM_TARGET_FRACTION=$MEM_TARGET_FRACTION, WORKER_MEM_ESTIMATE_MB=$WORKER_MEM_ESTIMATE_MB -> starting at $(compute_workers) workers, will scale with available memory"
 
   trap 'log "shutting down"; kill -- -$$ 2>/dev/null || true' INT TERM
 
@@ -359,35 +372,74 @@ role_supervisor() {
   ( "$0" acquire --mode "$MODE" 2>&1 | sed -u 's/^/[acquire] /' | tee -a "$LOGS/acquire.log" ) &
   local acquire_pid=$!
 
+  # Re-evaluated on every call (not sized once at startup) so the worker count
+  # tracks memory headroom as it opens up (e.g. other batches committing,
+  # unrelated processes exiting) instead of being stuck at whatever the launch
+  # moment happened to allow. Never kills anything to scale down — each
+  # worker's own wait_for_memory already throttles that side. A fresh index
+  # per spawn also means a worker that died (OOM, crash) just gets replaced
+  # here on the next poll rather than needing a full pipeline restart.
   local -a worker_pids=()
-  spawn_workers() {
-    worker_pids=()
-    local i
-    for ((i = 0; i < WORKERS; i++)); do
-      ( "$0" worker --mode "$MODE" "$i" 2>&1 | sed -u "s/^/[w${i}] /" | tee -a "$LOGS/w${i}.log" ) &
+  local next_worker_idx=0
+  top_up_workers() {
+    local need remaining i
+    # compute_workers() reads live system-wide usage, which already includes
+    # every currently-running worker's footprint — so its result IS "how many
+    # more fit right now", not a total to reconcile against the current
+    # count. (At startup, with zero workers running, that's the same number
+    # either way, which is why the original single-shot call worked.)
+    need="$(compute_workers)"
+    [[ $need -le 0 ]] && return
+    # compute_workers() only knows about memory, not remaining work. During
+    # active collection that's fine — is_candidate's freshness gate means
+    # list_candidates can read 0 for a moment even with plenty of work still
+    # to come, so capping on it here would block the very first spawn.
+    # Once collection is done, though, "no more will ever appear" is a safe
+    # assumption — cap there so the drain phase can't spawn idle workers
+    # faster than the ones already idling out finish their exit countdown,
+    # which would never converge.
+    if [[ -f "$COLLECTION_DONE" ]]; then
+      # list_candidates' own exit status is nonzero once nothing is left (its
+      # last executed statement is a failing `is_candidate && echo` inside a
+      # for loop) — exactly the case here. A plain assignment doesn't get the
+      # if/while exemption a bare `[[ ... ]]` condition would, so under
+      # set -e this kills the whole supervisor unless neutralized.
+      remaining="$(rebuild_done; list_candidates | wc -l)" || true
+      [[ $need -gt $remaining ]] && need=$remaining
+      [[ $need -le 0 ]] && return
+    fi
+    [[ ${#worker_pids[@]} -gt 0 ]] && log "memory headroom available ($(mem_used_mb)MB/$(mem_total_mb)MB used): adding $need worker(s) to the ${#worker_pids[@]} running"
+    for ((i = 0; i < need; i++)); do
+      ( "$0" worker --mode "$MODE" "$next_worker_idx" 2>&1 | sed -u "s/^/[w${next_worker_idx}] /" | tee -a "$LOGS/w${next_worker_idx}.log" ) &
       worker_pids+=($!)
+      next_worker_idx=$((next_worker_idx + 1))
     done
   }
-  spawn_workers
+  top_up_workers
   wait "$acquire_pid" || true
-  wait "${worker_pids[@]}" || true
 
-  # Drain: relaunch until 2 consecutive passes find nothing left (see
-  # AGENT.md) — a single clean scan could be a transient glitch, and trusting
-  # it alone here risks merging before everything's actually exported, not
-  # just losing a worker the way role_worker's equivalent check would.
+  # Monitor: prune workers that exited (normal drain-out or a crash) and top
+  # back up while there's still work — same idle-detection reasoning as
+  # role_worker's empty-scan check (AGENT.md): 2 consecutive dry passes with
+  # zero live workers and zero candidates before treating the run as done,
+  # since a single clean scan could be a transient glitch.
   local drained_scans=0
   while [[ $drained_scans -lt 2 ]]; do
+    local -a alive=() pid
+    for pid in "${worker_pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+    done
+    worker_pids=("${alive[@]}")
+
     rebuild_done
-    if [[ -z "$(list_candidates | head -1)" ]] && [[ -z "$(ls -A "$CLAIMED" 2>/dev/null)" ]]; then
+    if [[ ${#worker_pids[@]} -eq 0 ]] && [[ -z "$(list_candidates | head -1)" ]] && [[ -z "$(ls -A "$CLAIMED" 2>/dev/null)" ]]; then
       drained_scans=$((drained_scans + 1))
       sleep 5
       continue
     fi
     drained_scans=0
-    log "drain pass found leftover work, relaunching workers"
-    spawn_workers
-    wait "${worker_pids[@]}" || true
+    top_up_workers
+    sleep 60
   done
 
   local -a batch_dirs=("$EXPORT_ROOT"/batch_*)

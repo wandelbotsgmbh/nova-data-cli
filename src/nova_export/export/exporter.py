@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import Callable, Generator
 from pathlib import Path
 
@@ -199,6 +200,37 @@ def _validate_sources(dataset, config: ExportConfig, segment_id: str) -> None:
         )
 
 
+def _load_episode_metadata(
+    rrd_paths: list[Path] | None, fields: list[str]
+) -> dict[str, dict[str, float]]:
+    """Read episode_metadata fields from each recording's sibling meta.json.
+
+    Keyed by segment_id, which for local rrd_paths exports is exactly the
+    recording's directory name (<dataset>/<recording_id>/recording.rrd) —
+    the same recording_id the collector assigns and rerun uses as the
+    segment ID, so no separate ID plumbing is needed.
+    """
+    if not fields:
+        return {}
+    if not rrd_paths:
+        logger.warning(
+            "episode_metadata {} configured but exporting from catalog_url "
+            "(no local meta.json available) — skipping",
+            fields,
+        )
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for rrd_path in rrd_paths:
+        meta_path = rrd_path.parent / "meta.json"
+        if not meta_path.is_file():
+            continue
+        meta = json.loads(meta_path.read_text())
+        segment_id = rrd_path.parent.name
+        result[segment_id] = {f: meta[f] for f in fields if f in meta}
+    return result
+
+
 def _raise_fd_limit_for(num_files: int) -> None:
     """Best-effort: raise this process's open-file limit to fit num_files.
 
@@ -360,6 +392,10 @@ def export_recordings(
         # Create the export head (Layer 2: format-specific writer)
         head = _create_export_head(config, output_dir)
 
+        episode_metadata_by_segment = _load_episode_metadata(
+            rrd_paths, config.episode_metadata
+        )
+
         # For the max_episode_duration_s safety check: fetch the dataset's
         # per-segment raw time ranges once (a cheap manifest-metadata read),
         # rather than once per episode.
@@ -451,6 +487,20 @@ def export_recordings(
                         }
                     )
                     continue
+
+                if config.episode_metadata:
+                    found = episode_metadata_by_segment.get(segment_id, {})
+                    missing = [f for f in config.episode_metadata if f not in found]
+                    if missing:
+                        logger.warning(
+                            "Episode {} ({}): meta.json missing {} — filled with 0.0",
+                            episode_id,
+                            segment_id[:8],
+                            missing,
+                        )
+                    episode.extra_metadata = {
+                        f: found.get(f, 0.0) for f in config.episode_metadata
+                    }
 
                 # Check if episode has samples
                 if not episode.samples:
