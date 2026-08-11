@@ -158,6 +158,21 @@ class ExportConfig(BaseModel):
         description="Task label written to the dataset",
     )
 
+    task_field: str | None = Field(
+        default=None,
+        description=(
+            "meta.json field name (e.g. 'task') holding this episode's "
+            "natural-language task instruction. When set, each episode's "
+            "LeRobot 'task' is read from its own meta.json instead of the "
+            "fixed task_description, mirroring how LeRobot's task/task_index "
+            "mechanism is meant to vary per episode. Falls back to "
+            "task_description when the field is missing for a given episode, "
+            "or when no local meta.json is available (e.g. exporting from "
+            "catalog_url). Requires local rrd_paths export, like "
+            "episode_metadata."
+        ),
+    )
+
     dataset_id: str = Field(
         default="nova/dataset",
         description="Dataset identifier (repo_id for LeRobot, dataset name for Groot)",

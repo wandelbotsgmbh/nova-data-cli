@@ -23,6 +23,7 @@ import contextlib
 import json
 from collections.abc import Callable, Generator
 from pathlib import Path
+from typing import Any
 
 import rerun as rr
 from loguru import logger
@@ -200,34 +201,72 @@ def _validate_sources(dataset, config: ExportConfig, segment_id: str) -> None:
         )
 
 
+def _resolve_extra_metadata(found: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+    """Build one episode's extra_metadata dict from its meta.json values.
+
+    A field missing from `found` becomes None, not 0.0 — 0.0 was only
+    correct by accident for numeric fields and actively wrong for a field
+    like cube_color ("purple").
+    """
+    return {f: found.get(f) for f in fields}
+
+
+def _resolve_task(
+    found: dict[str, Any], task_field: str | None, task_description: str
+) -> str:
+    """Resolve one episode's task string.
+
+    task_field's value from meta.json when set and present; task_description
+    otherwise (unset task_field, or the field missing from this episode's
+    meta.json) — the same fallback either way, so a per-recording gap in
+    metadata degrades to today's dataset-wide constant rather than failing.
+    """
+    if not task_field:
+        return task_description
+    value = found.get(task_field)
+    return task_description if value is None else str(value)
+
+
 def _load_episode_metadata(
-    rrd_paths: list[Path] | None, fields: list[str]
-) -> dict[str, dict[str, float]]:
-    """Read episode_metadata fields from each recording's sibling meta.json.
+    rrd_paths: list[Path] | None,
+    fields: list[str],
+    task_field: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read episode_metadata fields (and optionally task_field) from each
+    recording's sibling meta.json.
 
     Keyed by segment_id, which for local rrd_paths exports is exactly the
     recording's directory name (<dataset>/<recording_id>/recording.rrd) —
     the same recording_id the collector assigns and rerun uses as the
-    segment ID, so no separate ID plumbing is needed.
+    segment ID, so no separate ID plumbing is needed. Values are whatever
+    JSON scalar type meta.json holds (str/float/int/bool) — not float-only.
+
+    When task_field is set, its value (if present) is included in the
+    per-segment dict under its own key, alongside the requested
+    episode_metadata fields — one meta.json read serves both.
     """
-    if not fields:
+    if not fields and not task_field:
         return {}
     if not rrd_paths:
         logger.warning(
-            "episode_metadata {} configured but exporting from catalog_url "
-            "(no local meta.json available) — skipping",
+            "episode_metadata {} / task_field {!r} configured but exporting "
+            "from catalog_url (no local meta.json available) — skipping",
             fields,
+            task_field,
         )
         return {}
 
-    result: dict[str, dict[str, float]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for rrd_path in rrd_paths:
         meta_path = rrd_path.parent / "meta.json"
         if not meta_path.is_file():
             continue
         meta = json.loads(meta_path.read_text())
         segment_id = rrd_path.parent.name
-        result[segment_id] = {f: meta[f] for f in fields if f in meta}
+        entry: dict[str, Any] = {f: meta[f] for f in fields if f in meta}
+        if task_field and task_field in meta:
+            entry[task_field] = meta[task_field]
+        result[segment_id] = entry
     return result
 
 
@@ -393,7 +432,7 @@ def export_recordings(
         head = _create_export_head(config, output_dir)
 
         episode_metadata_by_segment = _load_episode_metadata(
-            rrd_paths, config.episode_metadata
+            rrd_paths, config.episode_metadata, config.task_field
         )
 
         # For the max_episode_duration_s safety check: fetch the dataset's
@@ -488,19 +527,32 @@ def export_recordings(
                     )
                     continue
 
+                found = episode_metadata_by_segment.get(segment_id, {})
+
                 if config.episode_metadata:
-                    found = episode_metadata_by_segment.get(segment_id, {})
                     missing = [f for f in config.episode_metadata if f not in found]
                     if missing:
                         logger.warning(
-                            "Episode {} ({}): meta.json missing {} — filled with 0.0",
+                            "Episode {} ({}): meta.json missing {} — filled with null",
                             episode_id,
                             segment_id[:8],
                             missing,
                         )
-                    episode.extra_metadata = {
-                        f: found.get(f, 0.0) for f in config.episode_metadata
-                    }
+                    episode.extra_metadata = _resolve_extra_metadata(
+                        found, config.episode_metadata
+                    )
+
+                if config.task_field and found.get(config.task_field) is None:
+                    logger.warning(
+                        "Episode {} ({}): meta.json missing task_field {!r} "
+                        "— falling back to task_description",
+                        episode_id,
+                        segment_id[:8],
+                        config.task_field,
+                    )
+                episode.task = _resolve_task(
+                    found, config.task_field, config.task_description
+                )
 
                 # Check if episode has samples
                 if not episode.samples:

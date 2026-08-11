@@ -157,9 +157,11 @@ class LeRobotHead(ExportHead):
                 episode.extra_metadata
             )
 
+        task = episode.task if episode.task is not None else self.config.task_description
+
         try:
             for sample in tqdm(episode.samples, desc="Frames", leave=False):
-                frame = self._sample_to_frame(sample)
+                frame = self._sample_to_frame(sample, task)
                 self._dataset.add_frame(frame)
 
             self._dataset.save_episode()
@@ -227,11 +229,13 @@ class LeRobotHead(ExportHead):
             len(episodes_files),
         )
 
-    def _sample_to_frame(self, sample: Sample) -> dict[str, Any]:
+    def _sample_to_frame(self, sample: Sample, task: str) -> dict[str, Any]:
         """Convert a Sample to a LeRobot frame dict.
 
         Args:
             sample: Sample to convert.
+            task: Resolved task string for this sample's episode (either
+                Episode.task, when set, or config.task_description).
 
         Returns:
             Frame dict for LeRobotDataset.add_frame().
@@ -246,7 +250,7 @@ class LeRobotHead(ExportHead):
             frame["observation.state"] = sample.state
 
         # Task
-        frame["task"] = self.config.task_description
+        frame["task"] = task
 
         # Images
         for cam_name, img_array in sample.images.items():

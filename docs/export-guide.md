@@ -66,9 +66,12 @@ directly and `--recordings-dir` is ignored.
 | `cameras`                | list[object]                | `[]`              | Camera streams → `observation.images.<source>`. Each may set `width`/`height` to resize. See [Cameras](#cameras--resizing).                                                                    |
 | `trimming`               | object                      | `all_present`     | How episode start/end bounds are chosen. See [Trimming](#trimming-the-important-part).                                                                                                         |
 | `max_episode_duration_s` | float \| null               | `null` (no limit) | Reject a segment if its _raw_ recording span exceeds this many seconds — unrelated to trimming. See [Rejecting stuck or left-running recordings](#rejecting-stuck-or-left-running-recordings). |
-| `task_description`       | string                      | `"task"`          | Natural-language task label written to every frame.                                                                                                                                            |
+| `task_description`       | string                      | `"task"`          | Fallback task label written to every frame when `task_field` is unset (or its meta.json field is missing for a given episode).                                                                |
+| `task_field`             | string \| null              | `null`            | meta.json field name (e.g. `"task"`) holding each episode's own natural-language instruction — lets `task` vary per episode instead of being fixed dataset-wide. Falls back to `task_description`. Requires local export (same as `episode_metadata`).            |
 | `dataset_id`             | string                      | `nova/dataset`    | Dataset identifier — the LeRobot `repo_id` (also used for viz and Hugging Face push).                                                                                                          |
 | `version`                | int                         | `1`               | Config schema version. Leave at `1`.                                                                                                                                                           |
+
+`episode_metadata` values may be any JSON scalar type (string, number, boolean) — not float-only. A field missing from a given episode's `meta.json` is filled with `null` in that episode's row.
 
 ## Formats
 
