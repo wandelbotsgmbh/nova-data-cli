@@ -152,6 +152,16 @@ keeps this from monopolizing CPU/disk even without an active watchdog for
 those resources — it tells the kernel to prefer any other process, so the
 pipeline only consumes spare capacity.
 
+`top_up_workers` is polled every 60s for the pipeline's *entire* life —
+during acquisition as well as the post-`COLLECTION_DONE` drain loop, not just
+the latter — and on every call caps how many new workers it spawns against
+the live unclaimed backlog (`list_candidates`), not just available memory.
+Without both of these, the pool gets sized once, from whatever memory allowed
+at the instant collection started, and never adjusts again for the rest of a
+run that can last hours: if candidates become claimable slower than
+`workers × CHUNK` can consume, most of that pool just sits idle the whole
+time (see `docs/investigations/worker-pool-static-during-collection.md`).
+
 ## "Nothing left" needs confirmation, not a single scan
 
 A worker exits when it finds no candidates *and* `COLLECTION_DONE` exists; the

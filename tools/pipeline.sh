@@ -390,24 +390,25 @@ role_supervisor() {
     # either way, which is why the original single-shot call worked.)
     need="$(compute_workers)"
     [[ $need -le 0 ]] && return
-    # compute_workers() only knows about memory, not remaining work. During
-    # active collection that's fine — is_candidate's freshness gate means
-    # list_candidates can read 0 for a moment even with plenty of work still
-    # to come, so capping on it here would block the very first spawn.
-    # Once collection is done, though, "no more will ever appear" is a safe
-    # assumption — cap there so the drain phase can't spawn idle workers
-    # faster than the ones already idling out finish their exit countdown,
-    # which would never converge.
-    if [[ -f "$COLLECTION_DONE" ]]; then
-      # list_candidates' own exit status is nonzero once nothing is left (its
-      # last executed statement is a failing `is_candidate && echo` inside a
-      # for loop) — exactly the case here. A plain assignment doesn't get the
-      # if/while exemption a bare `[[ ... ]]` condition would, so under
-      # set -e this kills the whole supervisor unless neutralized.
-      remaining="$(rebuild_done; list_candidates | wc -l)" || true
-      [[ $need -gt $remaining ]] && need=$remaining
-      [[ $need -le 0 ]] && return
-    fi
+    # compute_workers() only knows about memory, not remaining work — cap the
+    # new-worker count against the actual unclaimed backlog too, or a run
+    # whose candidates trickle in slower than memory allows workers ends up
+    # with most of them spawned up front and idling for the rest of
+    # collection (see docs/investigations/worker-pool-static-during-collection.md).
+    # Safe to do unconditionally (not just once collection is done): this
+    # function is now polled every 60s throughout collection too (see the
+    # loop around its first call below), so a transient zero-candidate
+    # reading (e.g. is_candidate's freshness gate momentarily reading empty)
+    # just delays the next top-up by one poll instead of blocking it forever.
+    #
+    # list_candidates' own exit status is nonzero once nothing is left (its
+    # last executed statement is a failing `is_candidate && echo` inside a
+    # for loop) — a plain assignment doesn't get the if/while exemption a
+    # bare `[[ ... ]]` condition would, so under set -e this kills the whole
+    # supervisor unless neutralized.
+    remaining="$(rebuild_done; list_candidates | wc -l)" || true
+    [[ $need -gt $remaining ]] && need=$remaining
+    [[ $need -le 0 ]] && return
     [[ ${#worker_pids[@]} -gt 0 ]] && log "memory headroom available ($(mem_used_mb)MB/$(mem_total_mb)MB used): adding $need worker(s) to the ${#worker_pids[@]} running"
     for ((i = 0; i < need; i++)); do
       ( "$0" worker --mode "$MODE" "$next_worker_idx" 2>&1 | sed -u "s/^/[w${next_worker_idx}] /" | tee -a "$LOGS/w${next_worker_idx}.log" ) &
@@ -415,7 +416,17 @@ role_supervisor() {
       next_worker_idx=$((next_worker_idx + 1))
     done
   }
+  # Keep topping up while acquisition is still running, not just once at
+  # startup — otherwise the pool is permanently stuck at whatever memory
+  # happened to allow the instant collection began (often oversized relative
+  # to how fast candidates actually become claimable), for the entire
+  # collection phase, however long that is. Same poll cadence as the drain
+  # loop below.
   top_up_workers
+  while kill -0 "$acquire_pid" 2>/dev/null; do
+    sleep 60
+    top_up_workers
+  done
   wait "$acquire_pid" || true
 
   # Monitor: prune workers that exited (normal drain-out or a crash) and top
