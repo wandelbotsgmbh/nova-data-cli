@@ -337,10 +337,26 @@ role_worker() {
 
 # ---- supervisor -----------------------------------------------------------
 role_supervisor() {
-  # setsid makes this the leader of a fresh process group so `kill -- -$$` on
-  # shutdown reaches every descendant (see AGENT.md).
+  # setsid makes the real supervisor (below) the leader of a fresh
+  # session/process group so `kill -- -$$` on shutdown reliably reaches
+  # every descendant (workers, nova-data-cli, ffmpeg) regardless of how this
+  # script was invoked -- e.g. piped, where the default process group would
+  # otherwise be shared with unrelated commands (see AGENT.md).
+  #
+  # setsid also detaches from the controlling terminal, which has a side
+  # effect: Ctrl+C's SIGINT is delivered by the terminal driver to whatever
+  # process group the terminal currently has registered as foreground, and
+  # a setsid'd process is never in that group -- so Ctrl+C would otherwise
+  # go nowhere, even though the trap below is correctly set up to handle it.
+  # This outer wrapper stays attached to the terminal specifically to catch
+  # that Ctrl+C/SIGINT and forward it into the detached process group, so an
+  # interactive `bash tools/pipeline.sh` still responds to Ctrl+C normally.
   if [[ -z "${PIPELINE_RESPAWNED:-}" ]]; then
-    exec env PIPELINE_RESPAWNED=1 setsid "$0" supervisor --mode "$MODE"
+    PIPELINE_RESPAWNED=1 setsid "$0" supervisor --mode "$MODE" &
+    local inner_pid=$!
+    trap 'kill -TERM -- "-$inner_pid" 2>/dev/null' INT TERM
+    wait "$inner_pid"
+    exit $?
   fi
 
   exec 9>"$LOCK"
@@ -366,7 +382,9 @@ role_supervisor() {
 
   log "sizing: $(nproc) cores, $(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo) RAM, MEM_TARGET_FRACTION=$MEM_TARGET_FRACTION, WORKER_MEM_ESTIMATE_MB=$WORKER_MEM_ESTIMATE_MB -> starting at $(compute_workers) workers, will scale with available memory"
 
-  trap 'log "shutting down"; kill -- -$$ 2>/dev/null || true' INT TERM
+  # kill -- -$$ also signals this process itself (same pgid) -> re-enters
+  # this same trap before reaching exit, looping forever. Disarm first.
+  trap 'trap - INT TERM; log "shutting down"; kill -- -$$ 2>/dev/null || true; exit 130' INT TERM
 
   # Tee each role's output to both terminal (prefixed) and its log file.
   ( "$0" acquire --mode "$MODE" 2>&1 | sed -u 's/^/[acquire] /' | tee -a "$LOGS/acquire.log" ) &
