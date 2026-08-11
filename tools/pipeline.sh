@@ -13,14 +13,14 @@ if [[ -n "${PIPELINE_REMOTE_DIRS:-}" ]]; then
   IFS=':' read -r -a REMOTE_DIRS <<< "$PIPELINE_REMOTE_DIRS"
 else
   REMOTE_DIRS=(
-    "/mnt/data/sebastian/raw_datasets/dryrun_pose_algo_check"
+    "/mnt/data/sebastian/raw_datasets/pick_and_place_sim_20260810_201248"
   )
 fi
-WATCH_DIR="${PIPELINE_WATCH_DIR:-/mnt/data/sebastian/raw_datasets/dryrun_pose_algo_check}"
+WATCH_DIR="${PIPELINE_WATCH_DIR:-/home/sebi/ws/Data/raw_data/pick_and_place_sim_20260810_201248}"
 
-NOVA_CLI_DIR="${PIPELINE_NOVA_CLI_DIR:-/home/intern/ws/nova-data-cli}"
-EXPORT_CONFIG="${PIPELINE_EXPORT_CONFIG:-/home/intern/ws/pick_and_place_imitation_learning/data_collection/configs/lerobot_export.json}"
-EXPORT_ROOT="${PIPELINE_EXPORT_ROOT:-/mnt/data/sebastian/lerobot_datasets/dryrun_pose_algo_check}"
+NOVA_CLI_DIR="${PIPELINE_NOVA_CLI_DIR:-/home/sebi/ws/nova-data-cli}"
+EXPORT_CONFIG="${PIPELINE_EXPORT_CONFIG:-/home/sebi/ws/pick_and_place_imitation_learning/data_collection/configs/lerobot_export.json}"
+EXPORT_ROOT="${PIPELINE_EXPORT_ROOT:-/home/sebi/ws/Data/lerobot_datasets/pick_and_place_sim_20260810_201248}"
 read -r -a EXPORT_CLI_CMD <<< "${PIPELINE_EXPORT_CLI:-uv run nova-data-cli}"  # swap in a stub for tests
 
 CHUNK="${PIPELINE_CHUNK:-8}"
