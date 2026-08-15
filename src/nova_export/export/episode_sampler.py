@@ -30,6 +30,10 @@ from nova_export.export.video_decoder import (
 if TYPE_CHECKING:
     from nova_export.export.config import ExportConfig
 
+# signal_change trimming that keeps less than this share of the raw span is
+# almost certainly a mis-tuned threshold rather than a genuinely short episode.
+_TRIM_SUSPICIOUS_FRACTION = 0.5
+
 
 @dataclass
 class Sample:
@@ -416,6 +420,32 @@ class EpisodeSampler:
             )  # index into times (diff shifts by 1)
             trim_end = int(times[last_active_idx]) + cfg.tail_ms * 1_000_000
 
+            # A threshold set above the signal's real inter-sample motion does
+            # not always trip the "no activity at all" fallback above: a few
+            # noise/fast-move samples can still cross it and silently collapse a
+            # 40s episode to a second or two. Warn when the kept span is a small
+            # fraction of the raw one — that is the signature of too high a
+            # threshold, not of a genuinely short episode.
+            raw_span = raw_end_ns - raw_start_ns
+            kept_span = trim_end - trim_start
+            if raw_span > 0 and kept_span < _TRIM_SUSPICIOUS_FRACTION * raw_span:
+                logger.warning(
+                    "Trimming kept only {:.1f}s of {:.1f}s in segment {} "
+                    "({} of {} '{}' samples exceeded threshold={}). The threshold "
+                    "is likely above this signal's real inter-sample motion "
+                    "(median change {:.4g}, max {:.4g}) — lower it, or use "
+                    "mode='all_present'.",
+                    kept_span / 1e9,
+                    raw_span / 1e9,
+                    segment_id[:8],
+                    len(active_indices),
+                    len(diffs),
+                    cfg.source,
+                    cfg.threshold,
+                    float(np.median(diffs)),
+                    float(np.max(diffs)),
+                )
+
             return (trim_start, trim_end)
 
         return (raw_start_ns, raw_end_ns)
@@ -523,27 +553,22 @@ class EpisodeSampler:
             )
             raw_data[int(ts)] = {"action": action, "state": state}
 
-        # Resample to time_grid using nearest-neighbor lookup
+        # Resample to time_grid with a latest-at (causal) lookup: each grid
+        # point takes the most recent action/state at or before it. Nearest-
+        # neighbor would happily pick a *future* sample — with this action
+        # stream's dropouts (dt up to several hundred ms) that leaks commands
+        # issued after the observation they're paired with, i.e. exports an
+        # action that is "behind" its camera frame. Latest-at can never do that.
         sorted_query_ts = np.array(sorted(raw_data.keys()), dtype=np.int64)
         data: dict[int, dict[str, npt.NDArray[np.float32]]] = {}
 
         for target_ts in time_grid:
-            # Find nearest query timestamp
-            idx = np.searchsorted(sorted_query_ts, target_ts)
-            if idx == 0:
-                nearest_ts = sorted_query_ts[0]
-            elif idx >= len(sorted_query_ts):
-                nearest_ts = sorted_query_ts[-1]
-            else:
-                # Pick closest
-                if (target_ts - sorted_query_ts[idx - 1]) <= (
-                    sorted_query_ts[idx] - target_ts
-                ):
-                    nearest_ts = sorted_query_ts[idx - 1]
-                else:
-                    nearest_ts = sorted_query_ts[idx]
+            # searchsorted(side="right") - 1 is the last sample at or before
+            # target_ts; clamp at 0 for grid points preceding the first sample.
+            idx = int(np.searchsorted(sorted_query_ts, target_ts, side="right")) - 1
+            latest_ts = sorted_query_ts[max(idx, 0)]
 
-            data[int(target_ts)] = raw_data[int(nearest_ts)]
+            data[int(target_ts)] = raw_data[int(latest_ts)]
 
         return data
 

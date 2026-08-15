@@ -197,6 +197,17 @@ depends on the signal's units and noise floor:
 Start at `0.01` and raise it only if idle time is leaking in; if episodes come out
 suspiciously short, your threshold is above the real motion and should come down.
 
+**`threshold` is per *consecutive sample*, not total displacement**, so the right
+value depends on the source's sample rate as much as on its units. A slow arm
+logged at 64 ms may never move more than ~0.01 rad between two samples, in which
+case `threshold: 0.01` trims almost the entire episode away. The "no change
+exceeds it" fallback above does *not* save you here — a handful of samples still
+cross, so the episode collapses to a second or two instead of falling back. The
+export logs a warning whenever trimming keeps less than half the raw span; treat
+it as a signal to lower `threshold` or switch to `all_present`. When the action
+stream itself only exists while the task is being commanded, `all_present`
+already trims the idle lead-in for free and is the safer choice.
+
 ### Modes compared
 
 ![All trim modes compared](img/all_modes_compared.png)
@@ -228,7 +239,9 @@ check, so this doesn't need to be tight.
 - **Just want everything recorded?** `all_present` (default).
 - **A signal cleanly brackets the task?** `signal_presence` on that source.
 - **Need to cut idle lead-in/out automatically?** `signal_change` on a motion
-  signal (e.g. `joint_positions`), `threshold` ≈ `0.01`, `tail_ms` ≈ `500`.
+  signal (e.g. `joint_positions`), `threshold` ≈ `0.01`, `tail_ms` ≈ `500` — but
+  check the threshold against your source's actual inter-sample motion first
+  (see [Tuning `threshold`](#signal_change)).
 - **Dataset too big / training input smaller?** Set camera `width`/`height`.
 - **A few episodes are way longer than the rest (stuck sensor, forgotten recording)?**
   Set `max_episode_duration_s` to drop them.

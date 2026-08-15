@@ -3,8 +3,13 @@
   "format": "groot",
   "fps": 15,
   "index_column": "canonical_time",
-  "action": ["actions_target"],
-  "state": ["joint_positions", "gripper"],
+  "action": [
+    "actions_target"
+  ],
+  "state": [
+    "joint_positions",
+    "gripper"
+  ],
   "cameras": [
     {
       "source": "cam_flange"
@@ -17,10 +22,7 @@
     }
   ],
   "trimming": {
-    "mode": "signal_change",
-    "source": "joint_positions",
-    "threshold": 0.01,
-    "tail_ms": 500
+    "mode": "all_present"
   },
   "task_description": "pick-and-place",
   "dataset_id": "nova/pick-and-place"
