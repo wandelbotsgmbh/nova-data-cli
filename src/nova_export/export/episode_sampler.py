@@ -2,7 +2,8 @@
 
 This layer handles:
 - Building a fixed-rate time grid at target FPS
-- Sampling video frames at grid timestamps (decoded streaming, grid-aligned)
+- Sampling video frames at grid timestamps (decoded streaming, grid-aligned:
+  the earliest frame at or after each grid point, never an earlier one)
 - Querying action/state data at grid timestamps
 - Combining into unified Sample objects
 
@@ -104,9 +105,9 @@ class EpisodeSampler:
     2. Find the valid time range where all streams have data
     3. Build a time grid at target FPS
     4. Query action/state via fill_latest_at
-    5. Decode each video stream once, keeping only the frames nearest to the
-       grid timestamps (already resized) — full-resolution frames are never
-       accumulated in memory
+    5. Decode each video stream once, keeping only the earliest frame at or
+       after each grid timestamp (already resized) — full-resolution frames are
+       never accumulated in memory
     6. Combine into Sample objects
     """
 

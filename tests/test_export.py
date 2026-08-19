@@ -223,8 +223,8 @@ class TestFrameCache:
         result = cache.get_frame_at(5000)
         assert np.array_equal(result, frame)
 
-    def test_nearest_frame_lookup(self):
-        """Lookup returns nearest frame by timestamp."""
+    def test_at_or_after_frame_lookup(self):
+        """Lookup returns the earliest frame at or after the timestamp."""
         frames = [create_test_frame(value=i * 50) for i in range(5)]
         timestamps = np.array([0, 1000, 2000, 3000, 4000], dtype=np.int64)
         cache = FrameCache(frames=frames, timestamps_ns=timestamps)
@@ -239,14 +239,12 @@ class TestFrameCache:
         assert np.array_equal(cache.get_frame_at(2000), frames[2])
         assert np.array_equal(cache.get_frame_at(4000), frames[4])
 
-        # Nearest to lower
-        assert np.array_equal(cache.get_frame_at(400), frames[0])
-
-        # Nearest to upper
+        # Never earlier than the target: all of these round *up* to frame 1
+        assert np.array_equal(cache.get_frame_at(1), frames[1])
+        assert np.array_equal(cache.get_frame_at(400), frames[1])
+        assert np.array_equal(cache.get_frame_at(500), frames[1])
         assert np.array_equal(cache.get_frame_at(600), frames[1])
-
-        # Midpoint goes to lower
-        assert np.array_equal(cache.get_frame_at(500), frames[0])
+        assert np.array_equal(cache.get_frame_at(999), frames[1])
 
         # Before start
         assert np.array_equal(cache.get_frame_at(-1000), frames[0])
@@ -264,13 +262,19 @@ class TestFrameCache:
         assert cache.get_frame_index(200) == 1
         assert cache.get_frame_index(300) == 2
 
-        # Nearest (equidistant rounds to earlier frame with <=)
-        assert cache.get_frame_index(140) == 0
+        # Non-exact targets round *up* — never to a frame before the target
+        assert cache.get_frame_index(101) == 1
+        assert cache.get_frame_index(140) == 1
         assert cache.get_frame_index(160) == 1
-        assert (
-            cache.get_frame_index(250) == 1
-        )  # Equidistant (50 from 200 and 300) -> earlier
-        assert cache.get_frame_index(251) == 2  # Closer to 300
+        assert cache.get_frame_index(250) == 2
+        assert cache.get_frame_index(251) == 2
+
+        # Before the first frame -> first frame; past the last -> last frame
+        assert cache.get_frame_index(50) == 0
+        assert cache.get_frame_index(1000) == 2
+
+        # Empty cache
+        assert FrameCache().get_frame_index(100) == -1
 
 
 # =============================================================================

@@ -5,7 +5,7 @@ Decodes video packets in order (no keyframe hunting). Two modes:
 - `load_packets()` + `decode_at()`: the memory-efficient path used by the
   export pipeline. Packets (compressed) are loaded first so time bounds are
   known before decoding, then the stream is decoded once and only the frames
-  nearest to the requested sample timestamps are kept (already resized).
+  at or after the requested sample timestamps are kept (already resized).
 - `decode_segment()`: decodes *all* frames into a FrameCache. Simple, but holds
   every decoded frame in memory — only suitable for short segments/tests.
 """
@@ -49,7 +49,8 @@ def resize_rgb(
 class FrameCache:
     """In-memory cache of decoded video frames with timestamp indexing.
 
-    Provides O(1) lookup of the nearest frame to any target timestamp.
+    Provides O(1) lookup of the earliest frame at or after any target
+    timestamp.
     """
 
     frames: list[npt.NDArray[np.uint8]] = field(default_factory=list)
@@ -77,34 +78,30 @@ class FrameCache:
         return (self.end_ns - self.start_ns) / 1e9
 
     def get_frame_at(self, target_ns: int) -> npt.NDArray[np.uint8] | None:
-        """Get the frame nearest to the target timestamp.
+        """Get the earliest frame at or after the target timestamp.
 
         Args:
             target_ns: Target timestamp in nanoseconds.
 
         Returns:
-            The nearest frame as HWC uint8 RGB array, or None if cache is empty.
+            The selected frame as HWC uint8 RGB array, or None if cache is
+            empty.
         """
         idx = self.get_frame_index(target_ns)
         return self.frames[idx] if idx >= 0 else None
 
     def get_frame_index(self, target_ns: int) -> int:
-        """Get the index of the frame nearest to the target timestamp."""
+        """Index of the earliest frame at or after the target timestamp.
+
+        Never returns a frame *earlier* than the target — an observation can't
+        predate the action paired with it. Targets past the end of the stream
+        clamp to the last frame; -1 when the cache is empty.
+        """
         if len(self.timestamps_ns) == 0:
             return -1
 
-        idx = np.searchsorted(self.timestamps_ns, target_ns)
-
-        if idx == 0:
-            return 0
-        if idx >= len(self.timestamps_ns):
-            return len(self.timestamps_ns) - 1
-
-        if (target_ns - self.timestamps_ns[idx - 1]) <= (
-            self.timestamps_ns[idx] - target_ns
-        ):
-            return idx - 1
-        return idx
+        idx = int(np.searchsorted(self.timestamps_ns, target_ns, side="left"))
+        return min(idx, len(self.timestamps_ns) - 1)
 
 
 @dataclass
@@ -408,15 +405,17 @@ class VideoDecoder:
         target_timestamps_ns: npt.NDArray[np.int64],
         target_size: tuple[int, int] | None = None,
     ) -> FrameCache:
-        """Decode a segment, keeping only the frames nearest each target timestamp.
+        """Decode a segment, keeping the earliest frame at/after each target.
 
         The stream is decoded sequentially exactly once, but instead of caching
-        every decoded frame, each target timestamp is resolved to its nearest
-        frame on the fly (ties to the earlier frame, clamped at both ends —
-        the same selection rule as ``FrameCache.get_frame_at``). Only selected
-        frames are retained, already resized to ``target_size``, so peak memory
-        is one raw decoded frame plus the selected output frames. Decoding
-        stops early once every target is resolved.
+        every decoded frame, each target timestamp is resolved on the fly to
+        the earliest decoded frame at or after it — never an earlier one, so a
+        camera observation can't predate the action paired with it (the same
+        selection rule as ``FrameCache.get_frame_at``). Targets past the end of
+        the stream clamp to the last decoded frame. Only selected frames are
+        retained, already resized to ``target_size``, so peak memory is one raw
+        decoded frame plus the selected output frames. Decoding stops early
+        once every target is resolved.
 
         Args:
             packets: Packet series from :meth:`load_packets`.
@@ -432,42 +431,36 @@ class VideoDecoder:
         num_targets = len(targets)
         frames_out: list[npt.NDArray[np.uint8]] = []
 
-        prev_frame: npt.NDArray[np.uint8] | None = None
-        prev_ts = 0
-        prev_out: npt.NDArray[np.uint8] | None = None  # processed prev_frame
+        cur_frame: npt.NDArray[np.uint8] | None = None
+        cur_ts = 0
+        cur_out: npt.NDArray[np.uint8] | None = None  # processed cur_frame
 
-        def emit_prev() -> npt.NDArray[np.uint8]:
+        def emit_cur() -> npt.NDArray[np.uint8]:
             # Resize lazily and once per selected source frame.
-            nonlocal prev_out
-            if prev_out is None:
-                assert prev_frame is not None
+            nonlocal cur_out
+            if cur_out is None:
+                assert cur_frame is not None
                 if target_size is not None:
-                    prev_out = resize_rgb(prev_frame, *target_size)
+                    cur_out = resize_rgb(cur_frame, *target_size)
                 else:
-                    prev_out = prev_frame
-            return prev_out
+                    cur_out = cur_frame
+            return cur_out
 
         decoded_frames = 0
         for frame, ts in self._iter_frames(packets):
             decoded_frames += 1
-            if prev_frame is None:
-                prev_frame, prev_ts = frame, ts
-                continue
+            cur_frame, cur_ts, cur_out = frame, ts, None
 
-            # All targets at or before the midpoint of (prev, current) are
-            # nearest to prev (ties go to the earlier frame).
-            while len(frames_out) < num_targets and (
-                targets[len(frames_out)] - prev_ts
-            ) <= (ts - targets[len(frames_out)]):
-                frames_out.append(emit_prev())
+            # This is the earliest decoded frame at or after every remaining
+            # target up to `ts` — emit it for all of them.
+            while len(frames_out) < num_targets and targets[len(frames_out)] <= ts:
+                frames_out.append(emit_cur())
 
             if len(frames_out) >= num_targets:
                 # Every target resolved — skip decoding the rest of the stream.
                 break
 
-            prev_frame, prev_ts, prev_out = frame, ts, None
-
-        if prev_frame is None:
+        if cur_frame is None:
             logger.warning(
                 "No frames decoded from {} packets for {}",
                 packets.num_packets,
@@ -475,9 +468,20 @@ class VideoDecoder:
             )
             return FrameCache()
 
-        # Remaining targets are at/after the last frame: clamp to it.
+        if len(frames_out) < num_targets:
+            # Targets past the last decoded frame clamp to it — the one case
+            # where the at-or-after rule can still under-shoot the target.
+            logger.warning(
+                "{} of {} targets for {} fall past the last decoded frame "
+                "(last frame {}ns, last target {}ns) — clamped to it",
+                num_targets - len(frames_out),
+                num_targets,
+                packets.entity,
+                cur_ts,
+                int(targets[-1]),
+            )
         while len(frames_out) < num_targets:
-            frames_out.append(emit_prev())
+            frames_out.append(emit_cur())
 
         logger.info(
             "Decoded {} frames from {} packets for {}, kept {} grid frames",
