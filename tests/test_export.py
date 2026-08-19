@@ -172,6 +172,23 @@ def create_test_episode(
 
 
 # =============================================================================
+# ExportConfig Tests
+# =============================================================================
+
+
+class TestExportConfigTaskField:
+    """Tests for ExportConfig.task_field."""
+
+    def test_task_field_defaults_to_none(self):
+        config = ExportConfig(fps=15)
+        assert config.task_field is None
+
+    def test_task_field_can_be_set(self):
+        config = ExportConfig(fps=15, task_field="task")
+        assert config.task_field == "task"
+
+
+# =============================================================================
 # FrameCache Tests
 # =============================================================================
 
@@ -206,8 +223,8 @@ class TestFrameCache:
         result = cache.get_frame_at(5000)
         assert np.array_equal(result, frame)
 
-    def test_nearest_frame_lookup(self):
-        """Lookup returns nearest frame by timestamp."""
+    def test_at_or_after_frame_lookup(self):
+        """Lookup returns the earliest frame at or after the timestamp."""
         frames = [create_test_frame(value=i * 50) for i in range(5)]
         timestamps = np.array([0, 1000, 2000, 3000, 4000], dtype=np.int64)
         cache = FrameCache(frames=frames, timestamps_ns=timestamps)
@@ -222,14 +239,12 @@ class TestFrameCache:
         assert np.array_equal(cache.get_frame_at(2000), frames[2])
         assert np.array_equal(cache.get_frame_at(4000), frames[4])
 
-        # Nearest to lower
-        assert np.array_equal(cache.get_frame_at(400), frames[0])
-
-        # Nearest to upper
+        # Never earlier than the target: all of these round *up* to frame 1
+        assert np.array_equal(cache.get_frame_at(1), frames[1])
+        assert np.array_equal(cache.get_frame_at(400), frames[1])
+        assert np.array_equal(cache.get_frame_at(500), frames[1])
         assert np.array_equal(cache.get_frame_at(600), frames[1])
-
-        # Midpoint goes to lower
-        assert np.array_equal(cache.get_frame_at(500), frames[0])
+        assert np.array_equal(cache.get_frame_at(999), frames[1])
 
         # Before start
         assert np.array_equal(cache.get_frame_at(-1000), frames[0])
@@ -247,13 +262,19 @@ class TestFrameCache:
         assert cache.get_frame_index(200) == 1
         assert cache.get_frame_index(300) == 2
 
-        # Nearest (equidistant rounds to earlier frame with <=)
-        assert cache.get_frame_index(140) == 0
+        # Non-exact targets round *up* — never to a frame before the target
+        assert cache.get_frame_index(101) == 1
+        assert cache.get_frame_index(140) == 1
         assert cache.get_frame_index(160) == 1
-        assert (
-            cache.get_frame_index(250) == 1
-        )  # Equidistant (50 from 200 and 300) -> earlier
-        assert cache.get_frame_index(251) == 2  # Closer to 300
+        assert cache.get_frame_index(250) == 2
+        assert cache.get_frame_index(251) == 2
+
+        # Before the first frame -> first frame; past the last -> last frame
+        assert cache.get_frame_index(50) == 0
+        assert cache.get_frame_index(1000) == 2
+
+        # Empty cache
+        assert FrameCache().get_frame_index(100) == -1
 
 
 # =============================================================================
@@ -710,6 +731,75 @@ class TestLeRobotHead:
             mock_dataset.save_episode.assert_called_once()
 
     @patch("lerobot.datasets.lerobot_dataset.LeRobotDataset")
+    def test_write_episode_uses_per_episode_task(self, mock_dataset_cls):
+        """When Episode.task is set, every frame's 'task' must use it —
+        not the dataset-wide config.task_description."""
+        mock_dataset = MagicMock()
+        mock_dataset_cls.create.return_value = mock_dataset
+
+        config = ExportConfig(fps=15, task_description="fallback_task")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            head = LeRobotHead(config, Path(tmpdir) / "output")
+            head.initialize({"action": {"dtype": "float32", "shape": (7,)}})
+
+            episode = create_test_episode(num_samples=3)
+            episode.task = "Pick the purple cube up."
+            head.write_episode(episode)
+
+            for call in mock_dataset.add_frame.call_args_list:
+                frame = call.args[0]
+                assert frame["task"] == "Pick the purple cube up."
+
+    @patch("lerobot.datasets.lerobot_dataset.LeRobotDataset")
+    def test_write_episode_falls_back_to_task_description(self, mock_dataset_cls):
+        """When Episode.task is unset (None), fall back to config.task_description —
+        this is the byte-for-byte-identical-to-today path."""
+        mock_dataset = MagicMock()
+        mock_dataset_cls.create.return_value = mock_dataset
+
+        config = ExportConfig(fps=15, task_description="fallback_task")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            head = LeRobotHead(config, Path(tmpdir) / "output")
+            head.initialize({"action": {"dtype": "float32", "shape": (7,)}})
+
+            episode = create_test_episode(num_samples=3)  # episode.task defaults to None
+
+            head.write_episode(episode)
+
+            for call in mock_dataset.add_frame.call_args_list:
+                frame = call.args[0]
+                assert frame["task"] == "fallback_task"
+
+    @patch("lerobot.datasets.lerobot_dataset.LeRobotDataset")
+    def test_different_episodes_can_have_different_tasks(self, mock_dataset_cls):
+        """Two episodes with distinct task strings both write their own value —
+        proves this is LeRobot's per-episode task mechanism, not a renamed
+        per-dataset constant."""
+        mock_dataset = MagicMock()
+        mock_dataset_cls.create.return_value = mock_dataset
+
+        config = ExportConfig(fps=15)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            head = LeRobotHead(config, Path(tmpdir) / "output")
+            head.initialize({"action": {"dtype": "float32", "shape": (7,)}})
+
+            episode_a = create_test_episode(segment_id="a", num_samples=1)
+            episode_a.task = "Task A"
+            episode_b = create_test_episode(segment_id="b", num_samples=1)
+            episode_b.task = "Task B"
+
+            head.write_episode(episode_a)
+            head.write_episode(episode_b)
+
+            frame_a = mock_dataset.add_frame.call_args_list[0].args[0]
+            frame_b = mock_dataset.add_frame.call_args_list[1].args[0]
+            assert frame_a["task"] == "Task A"
+            assert frame_b["task"] == "Task B"
+
+    @patch("lerobot.datasets.lerobot_dataset.LeRobotDataset")
     def test_write_empty_episode(self, mock_dataset_cls):
         """Test writing empty episode returns False."""
         mock_dataset = MagicMock()
@@ -884,6 +974,135 @@ class TestOverlappingActionState:
         assert np.array_equal(
             data[100_000_000]["state"], np.array([3.0, 4.0], dtype=np.float32)
         )
+
+
+class TestResolveExtraMetadata:
+    """Tests for exporter._resolve_extra_metadata."""
+
+    def test_present_fields_pass_through_any_type(self):
+        from nova_export.export.exporter import _resolve_extra_metadata
+
+        found = {"cube_x_mm": -324.15, "cube_color": "purple"}
+
+        result = _resolve_extra_metadata(found, ["cube_x_mm", "cube_color"])
+
+        assert result == {"cube_x_mm": -324.15, "cube_color": "purple"}
+
+    def test_missing_field_defaults_to_none_not_zero(self):
+        from nova_export.export.exporter import _resolve_extra_metadata
+
+        found = {"cube_x_mm": 1.5}  # cube_color absent
+
+        result = _resolve_extra_metadata(found, ["cube_x_mm", "cube_color"])
+
+        assert result == {"cube_x_mm": 1.5, "cube_color": None}
+
+
+class TestResolveTask:
+    """Tests for exporter._resolve_task."""
+
+    def test_task_field_unset_uses_task_description(self):
+        from nova_export.export.exporter import _resolve_task
+
+        result = _resolve_task({}, None, "fallback_task")
+
+        assert result == "fallback_task"
+
+    def test_task_field_present_used_verbatim(self):
+        from nova_export.export.exporter import _resolve_task
+
+        found = {"task": "Pick the purple cube up."}
+
+        result = _resolve_task(found, "task", "fallback_task")
+
+        assert result == "Pick the purple cube up."
+
+    def test_task_field_missing_from_found_falls_back(self):
+        from nova_export.export.exporter import _resolve_task
+
+        found = {"other_field": 1}  # no "task" key
+
+        result = _resolve_task(found, "task", "fallback_task")
+
+        assert result == "fallback_task"
+
+    def test_task_field_present_but_null_falls_back(self):
+        # meta.json had `"task": null` — the key exists but its value is
+        # None. This must fall back exactly like a missing key, and the
+        # per-episode warning in export_recordings uses
+        # `found.get(config.task_field) is None` (not `not in found`) so it
+        # fires on this case too.
+        from nova_export.export.exporter import _resolve_task
+
+        found = {"task": None}
+
+        result = _resolve_task(found, "task", "fallback_task")
+
+        assert result == "fallback_task"
+        assert found.get("task") is None  # same predicate export_recordings warns on
+
+
+class TestLoadEpisodeMetadata:
+    """Tests for exporter._load_episode_metadata."""
+
+    def test_string_field_round_trips(self, tmp_path):
+        from nova_export.export.exporter import _load_episode_metadata
+
+        rec_dir = tmp_path / "04cb4f25d3ef"
+        rec_dir.mkdir()
+        (rec_dir / "meta.json").write_text(
+            '{"cube_color": "purple", "cube_x_mm": -324.15}'
+        )
+        rrd_path = rec_dir / "recording.rrd"
+        rrd_path.touch()
+
+        result = _load_episode_metadata([rrd_path], ["cube_color", "cube_x_mm"])
+
+        assert result["04cb4f25d3ef"]["cube_color"] == "purple"
+        assert result["04cb4f25d3ef"]["cube_x_mm"] == -324.15
+
+    def test_missing_field_simply_absent_from_result(self, tmp_path):
+        from nova_export.export.exporter import _load_episode_metadata
+
+        rec_dir = tmp_path / "rec01"
+        rec_dir.mkdir()
+        (rec_dir / "meta.json").write_text('{"cube_x_mm": 1.5}')
+        rrd_path = rec_dir / "recording.rrd"
+        rrd_path.touch()
+
+        result = _load_episode_metadata([rrd_path], ["cube_x_mm", "cube_color"])
+
+        assert result["rec01"] == {"cube_x_mm": 1.5}
+        assert "cube_color" not in result["rec01"]
+
+    def test_task_field_value_included_in_result(self, tmp_path):
+        from nova_export.export.exporter import _load_episode_metadata
+
+        rec_dir = tmp_path / "04cb4f25d3ef"
+        rec_dir.mkdir()
+        (rec_dir / "meta.json").write_text(
+            '{"task": "Pick the purple cube up.", "cube_x_mm": 1.0}'
+        )
+        rrd_path = rec_dir / "recording.rrd"
+        rrd_path.touch()
+
+        result = _load_episode_metadata([rrd_path], ["cube_x_mm"], task_field="task")
+
+        assert result["04cb4f25d3ef"]["task"] == "Pick the purple cube up."
+        assert result["04cb4f25d3ef"]["cube_x_mm"] == 1.0
+
+    def test_task_field_none_does_not_add_task_key(self, tmp_path):
+        from nova_export.export.exporter import _load_episode_metadata
+
+        rec_dir = tmp_path / "rec01"
+        rec_dir.mkdir()
+        (rec_dir / "meta.json").write_text('{"task": "unused", "cube_x_mm": 1.0}')
+        rrd_path = rec_dir / "recording.rrd"
+        rrd_path.touch()
+
+        result = _load_episode_metadata([rrd_path], ["cube_x_mm"])  # task_field omitted
+
+        assert result["rec01"] == {"cube_x_mm": 1.0}
 
 
 # =============================================================================

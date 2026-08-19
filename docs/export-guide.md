@@ -66,9 +66,12 @@ directly and `--recordings-dir` is ignored.
 | `cameras`                | list[object]                | `[]`              | Camera streams → `observation.images.<source>`. Each may set `width`/`height` to resize. See [Cameras](#cameras--resizing).                                                                    |
 | `trimming`               | object                      | `all_present`     | How episode start/end bounds are chosen. See [Trimming](#trimming-the-important-part).                                                                                                         |
 | `max_episode_duration_s` | float \| null               | `null` (no limit) | Reject a segment if its _raw_ recording span exceeds this many seconds — unrelated to trimming. See [Rejecting stuck or left-running recordings](#rejecting-stuck-or-left-running-recordings). |
-| `task_description`       | string                      | `"task"`          | Natural-language task label written to every frame.                                                                                                                                            |
+| `task_description`       | string                      | `"task"`          | Fallback task label written to every frame when `task_field` is unset (or its meta.json field is missing for a given episode).                                                                |
+| `task_field`             | string \| null              | `null`            | meta.json field name (e.g. `"task"`) holding each episode's own natural-language instruction — lets `task` vary per episode instead of being fixed dataset-wide. Falls back to `task_description`. Requires local export (same as `episode_metadata`).            |
 | `dataset_id`             | string                      | `nova/dataset`    | Dataset identifier — the LeRobot `repo_id` (also used for viz and Hugging Face push).                                                                                                          |
 | `version`                | int                         | `1`               | Config schema version. Leave at `1`.                                                                                                                                                           |
+
+`episode_metadata` values may be any JSON scalar type (string, number, boolean) — not float-only. A field missing from a given episode's `meta.json` is filled with `null` in that episode's row.
 
 ## Formats
 
@@ -194,6 +197,17 @@ depends on the signal's units and noise floor:
 Start at `0.01` and raise it only if idle time is leaking in; if episodes come out
 suspiciously short, your threshold is above the real motion and should come down.
 
+**`threshold` is per *consecutive sample*, not total displacement**, so the right
+value depends on the source's sample rate as much as on its units. A slow arm
+logged at 64 ms may never move more than ~0.01 rad between two samples, in which
+case `threshold: 0.01` trims almost the entire episode away. The "no change
+exceeds it" fallback above does *not* save you here — a handful of samples still
+cross, so the episode collapses to a second or two instead of falling back. The
+export logs a warning whenever trimming keeps less than half the raw span; treat
+it as a signal to lower `threshold` or switch to `all_present`. When the action
+stream itself only exists while the task is being commanded, `all_present`
+already trims the idle lead-in for free and is the safer choice.
+
 ### Modes compared
 
 ![All trim modes compared](img/all_modes_compared.png)
@@ -225,7 +239,9 @@ check, so this doesn't need to be tight.
 - **Just want everything recorded?** `all_present` (default).
 - **A signal cleanly brackets the task?** `signal_presence` on that source.
 - **Need to cut idle lead-in/out automatically?** `signal_change` on a motion
-  signal (e.g. `joint_positions`), `threshold` ≈ `0.01`, `tail_ms` ≈ `500`.
+  signal (e.g. `joint_positions`), `threshold` ≈ `0.01`, `tail_ms` ≈ `500` — but
+  check the threshold against your source's actual inter-sample motion first
+  (see [Tuning `threshold`](#signal_change)).
 - **Dataset too big / training input smaller?** Set camera `width`/`height`.
 - **A few episodes are way longer than the rest (stuck sensor, forgotten recording)?**
   Set `max_episode_duration_s` to drop them.

@@ -158,9 +158,36 @@ class ExportConfig(BaseModel):
         description="Task label written to the dataset",
     )
 
+    task_field: str | None = Field(
+        default=None,
+        description=(
+            "meta.json field name (e.g. 'task') holding this episode's "
+            "natural-language task instruction. When set, each episode's "
+            "LeRobot 'task' is read from its own meta.json instead of the "
+            "fixed task_description, mirroring how LeRobot's task/task_index "
+            "mechanism is meant to vary per episode. Falls back to "
+            "task_description when the field is missing for a given episode, "
+            "or when no local meta.json is available (e.g. exporting from "
+            "catalog_url). Requires local rrd_paths export, like "
+            "episode_metadata."
+        ),
+    )
+
     dataset_id: str = Field(
         default="nova/dataset",
         description="Dataset identifier (repo_id for LeRobot, dataset name for Groot)",
+    )
+
+    episode_metadata: list[str] = Field(
+        default_factory=list,
+        description=(
+            "meta.json field names (e.g. 'cube_x_mm', 'cube_y_mm', 'cube_yaw_rad') "
+            "to add as extra columns on each episode's row in meta/episodes/*.parquet "
+            "(one value per episode, not repeated per frame). Requires local "
+            "rrd_paths export — meta.json must sit next to each recording's "
+            "recording.rrd. Ignored (with a warning) when exporting from a remote "
+            "catalog_url, since there's no local meta.json to read."
+        ),
     )
 
     @field_validator("index_column")
