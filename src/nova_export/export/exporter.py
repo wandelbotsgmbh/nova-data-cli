@@ -712,5 +712,9 @@ def _create_export_head(config: ExportConfig, output_dir: Path):
         from nova_export.export.heads.groot import GrootHead
 
         return GrootHead(config, output_dir)
+    elif config.format == "raw_multimodal":
+        from nova_export.export.heads.raw_multimodal import RawMultimodalHead
+
+        return RawMultimodalHead(config, output_dir)
     else:
         raise ValueError(f"Unknown export format: {config.format}")

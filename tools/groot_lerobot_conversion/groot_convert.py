@@ -35,6 +35,7 @@ from convert_v3_to_v2 import convert_dataset
 
 V30_SUFFIX = "_v3.0"
 MODALITY_FILENAME = "modality.json"
+EXPORT_SUMMARY_FILENAME = "export_summary.json"
 
 
 def _forward_modality(dataset_dir: Path) -> None:
@@ -59,6 +60,27 @@ def _forward_modality(dataset_dir: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(backup_modality, dest)
     logging.info("Forwarded GR00T %s → %s", MODALITY_FILENAME, dest)
+
+
+def _forward_export_summary(dataset_dir: Path) -> None:
+    """Copy export_summary.json from the preserved v3.0 backup into the v2.1 dataset.
+
+    Same rebuild-from-scratch issue as modality.json: pipeline.sh's
+    validate_batch.py requires this file at the dataset root to accept a batch,
+    so it must survive the v3.0 -> v2.1 conversion too.
+    """
+    backup_summary = dataset_dir.parent / f"{dataset_dir.name}{V30_SUFFIX}" / EXPORT_SUMMARY_FILENAME
+    if not backup_summary.exists():
+        logging.warning(
+            "No %s found in the v3.0 backup (%s); batch validation (pipeline.sh) will fail.",
+            EXPORT_SUMMARY_FILENAME,
+            backup_summary,
+        )
+        return
+
+    dest = dataset_dir / EXPORT_SUMMARY_FILENAME
+    shutil.copy2(backup_summary, dest)
+    logging.info("Forwarded %s → %s", EXPORT_SUMMARY_FILENAME, dest)
 
 
 def main() -> None:
@@ -96,6 +118,7 @@ def main() -> None:
     )
 
     _forward_modality(dataset_dir)
+    _forward_export_summary(dataset_dir)
     logging.info(
         "Done. GR00T v2.1 dataset at %s (original v3.0 preserved at %s%s).",
         dataset_dir,

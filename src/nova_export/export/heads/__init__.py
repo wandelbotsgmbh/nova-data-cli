@@ -12,7 +12,11 @@ def __getattr__(name: str):
         from nova_export.export.heads.groot import GrootHead
 
         return GrootHead
+    if name == "RawMultimodalHead":
+        from nova_export.export.heads.raw_multimodal import RawMultimodalHead
+
+        return RawMultimodalHead
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["ExportHead", "GrootHead", "LeRobotHead"]
+__all__ = ["ExportHead", "GrootHead", "LeRobotHead", "RawMultimodalHead"]

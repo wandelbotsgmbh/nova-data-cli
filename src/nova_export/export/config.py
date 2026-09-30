@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
     from nova_export.export.types import VideoSpec
 
-ExportFormat = Literal["lerobot_v3", "groot"]
+ExportFormat = Literal["lerobot_v3", "groot", "raw_multimodal"]
 
 # Rerun DataFusion column suffix for scalar arrays logged with rr.Scalars
 _SCALARS_SUFFIX = ":Scalars:scalars"
@@ -150,6 +150,19 @@ class ExportConfig(BaseModel):
             "many seconds — an upper-bound safety check for stuck or "
             "left-running recordings, independent of trimming. Checked cheaply "
             "via dataset metadata before any video decode. Unset means no limit."
+        ),
+    )
+
+    max_output_duration_s: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Hard cap on the trimmed episode's output duration, in seconds. "
+            "Applied after trimming: if the trimmed window is still longer "
+            "than this, its end is truncated (not rejected) to fit — uniformly "
+            "for every stream, since they all share one time grid. Unlike "
+            "max_episode_duration_s (which rejects the whole episode), this "
+            "keeps the episode and just shortens it. Unset means no cap."
         ),
     )
 

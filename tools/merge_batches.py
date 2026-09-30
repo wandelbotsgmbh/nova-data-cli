@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,9 +17,45 @@ from lerobot.datasets.aggregate import aggregate_datasets
 
 _VIDEO_INFO_KEYS_TO_CHECK = ("video.codec", "video.pix_format", "video.height", "video.width")
 
+# GR00T batches (format="groot") get converted in place to v2.1 by
+# tools/groot_lerobot_conversion, which preserves the original v3.0 export
+# alongside as "dataset_v3.0". lerobot's aggregate_datasets only understands
+# this CLI's pinned v3.0 schema, so for GR00T batches we must merge that
+# preserved v3.0 copy, not the converted v2.1 "dataset" dir — then redo the
+# GR00T conversion once on the merged result.
+_GROOT_CONVERTER_DIR = Path(__file__).resolve().parent / "groot_lerobot_conversion"
+
 
 def _dataset_dirs(batches_root: Path) -> list[Path]:
-    return sorted(p / "dataset" for p in batches_root.glob("batch_*") if (p / "dataset").is_dir())
+    dirs = []
+    for p in sorted(batches_root.glob("batch_*")):
+        v3_backup = p / "dataset_v3.0"
+        plain = p / "dataset"
+        if v3_backup.is_dir():
+            dirs.append(v3_backup)
+        elif plain.is_dir():
+            dirs.append(plain)
+    return dirs
+
+
+def _convert_merged_to_groot(merged_dir: Path, modality_source: Path) -> None:
+    """Re-run the GR00T v3.0->v2.1 conversion on the merged dataset.
+
+    aggregate_datasets rebuilds meta/ from scratch, so modality.json must be
+    seeded into the merged v3.0 dataset before conversion (it's identical
+    across batches, so any one batch's copy works).
+    """
+    shutil.copy2(modality_source, merged_dir / "meta" / "modality.json")
+
+    if shutil.which("uv") is None:
+        raise SystemExit(
+            "GR00T conversion needs `uv` on PATH. Convert the merged v3.0 dataset "
+            f"manually:\n  uv run --project {_GROOT_CONVERTER_DIR} groot-convert {merged_dir}"
+        )
+    print(f"Re-running GR00T conversion on merged dataset {merged_dir}...")
+    cmd = ["uv", "run", "--project", str(_GROOT_CONVERTER_DIR), "groot-convert", str(merged_dir)]
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    subprocess.run(cmd, check=True, env=env)
 
 
 def _load_info(dataset_dir: Path) -> dict:
@@ -85,6 +122,8 @@ def main():
     if tmp_output.exists():
         shutil.rmtree(tmp_output)
 
+    is_groot = dataset_dirs[0].name == "dataset_v3.0"
+
     print(f"Merging {len(dataset_dirs)} batches into {args.output} (via {tmp_output})")
     try:
         aggregate_datasets(
@@ -93,8 +132,13 @@ def main():
             roots=dataset_dirs,
             aggr_root=tmp_output,
         )
+        if is_groot:
+            _convert_merged_to_groot(
+                tmp_output, modality_source=dataset_dirs[0].parent / "dataset" / "meta" / "modality.json"
+            )
     except BaseException:
         shutil.rmtree(tmp_output, ignore_errors=True)
+        shutil.rmtree(f"{tmp_output}_v3.0", ignore_errors=True)
         raise
 
     os.rename(tmp_output, args.output)

@@ -11,6 +11,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import json
 import tempfile
 from datetime import datetime, timedelta
 from fractions import Fraction
@@ -21,6 +22,7 @@ import av
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pydantic import ValidationError
 
@@ -837,6 +839,96 @@ class TestLeRobotHead:
             assert result.num_episodes == 3
             assert result.num_frames == 45
             assert result.format == "lerobot_v3"
+
+
+# =============================================================================
+# RawMultimodalHead Tests
+# =============================================================================
+
+
+class TestRawMultimodalHead:
+    """Tests for the per-episode, unstitched multi-modality export head."""
+
+    def test_format_name(self):
+        from nova_export.export.heads.raw_multimodal import RawMultimodalHead
+
+        config = ExportConfig(fps=15)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            head = RawMultimodalHead(config, Path(tmpdir) / "output")
+            assert head.format_name == "raw_multimodal"
+
+    def test_split_camera_modality(self):
+        from nova_export.export.heads.raw_multimodal import _split_camera_modality
+
+        assert _split_camera_modality("cam_top") == ("cam_top", "rgb")
+        assert _split_camera_modality("cam_top_depth") == ("cam_top", "depth")
+        assert _split_camera_modality("cam_top_canny") == ("cam_top", "canny")
+        assert _split_camera_modality("cam_top_segmentation") == (
+            "cam_top",
+            "segmentation",
+        )
+
+    def test_write_episode_layout(self):
+        """Each camera's modalities land in one folder as separate mp4 files,
+        with an actions.parquet + meta.json sidecar, no cross-episode state."""
+        from nova_export.export.heads.raw_multimodal import RawMultimodalHead
+
+        config = ExportConfig(fps=15, task_description="pick and place")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "output"
+            head = RawMultimodalHead(config, output_dir)
+            head.initialize(head.infer_features(create_test_sample()))
+
+            episode = create_test_episode(
+                segment_id="008bfca20454",
+                episode_index=0,
+                num_samples=5,
+                fps=15,
+            )
+            # Give the episode two cameras: one rgb, one depth (same physical camera).
+            for s in episode.samples:
+                s.images = {
+                    "cam_top": create_test_frame(),
+                    "cam_top_depth": create_test_frame(value=50),
+                }
+
+            success = head.write_episode(episode)
+            assert success
+
+            episode_dir = output_dir / "008bfca20454"
+            assert (episode_dir / "cam_top" / "rgb.mp4").exists()
+            assert (episode_dir / "cam_top" / "depth.mp4").exists()
+            assert (episode_dir / "actions.parquet").exists()
+
+            meta = json.loads((episode_dir / "meta.json").read_text())
+            assert meta["recording_id"] == "008bfca20454"
+            assert meta["num_frames"] == 5
+            assert meta["task"] == "pick and place"
+            assert meta["cameras"] == {"cam_top": ["rgb", "depth"]}
+
+            table = pq.read_table(episode_dir / "actions.parquet")
+            assert table.num_rows == 5
+            assert set(table.column_names) == {
+                "timestamp_ns",
+                "frame_index",
+                "action",
+                "state",
+            }
+
+            result = head.finalize()
+            assert result.format == "raw_multimodal"
+            assert result.num_episodes == 1
+            assert result.num_frames == 5
+
+    def test_write_empty_episode_returns_false(self):
+        from nova_export.export.heads.raw_multimodal import RawMultimodalHead
+
+        config = ExportConfig(fps=15)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            head = RawMultimodalHead(config, Path(tmpdir) / "output")
+            empty_episode = Episode(segment_id="empty", episode_index=0, samples=[])
+            assert not head.write_episode(empty_episode)
 
 
 # =============================================================================

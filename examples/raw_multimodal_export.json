@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "format": "raw_multimodal",
+  "fps": 15,
+  "index_column": "canonical_time",
+  "action": ["actions_target"],
+  "state": ["joint_positions", "gripper_state"],
+  "cameras": [
+    { "source": "cam_top" },
+    { "source": "cam_top_depth" },
+    { "source": "cam_top_canny" },
+    { "source": "cam_top_segmentation" },
+    { "source": "cam_wrist" },
+    { "source": "cam_wrist_depth" },
+    { "source": "cam_wrist_canny" },
+    { "source": "cam_wrist_segmentation" },
+    { "source": "cam_side" },
+    { "source": "cam_side_depth" },
+    { "source": "cam_side_canny" },
+    { "source": "cam_side_segmentation" }
+  ],
+  "trimming": {
+    "mode": "signal_change",
+    "source": "joint_positions",
+    "threshold": 0.001,
+    "tail_ms": 500
+  },
+  "task_description": "pick-and-place",
+  "dataset_id": "nova/mult_mod_test"
+}
