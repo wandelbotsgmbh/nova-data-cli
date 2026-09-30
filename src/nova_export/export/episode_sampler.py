@@ -326,6 +326,18 @@ class EpisodeSampler:
             )
             return None
 
+        # Hard cap on output duration — truncate the end, don't reject.
+        if self.config.max_output_duration_s is not None:
+            cap_ns = valid_start_ns + int(self.config.max_output_duration_s * 1e9)
+            if cap_ns < valid_end_ns:
+                logger.info(
+                    "Segment {}: capping duration to {}s (was {:.2f}s)",
+                    segment_id[:8],
+                    self.config.max_output_duration_s,
+                    (valid_end_ns - valid_start_ns) / 1e9,
+                )
+                valid_end_ns = cap_ns
+
         return (valid_start_ns, valid_end_ns)
 
     def _apply_trimming(
